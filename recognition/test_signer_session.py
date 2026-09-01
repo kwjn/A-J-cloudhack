@@ -88,6 +88,28 @@ class SignerSessionControllerTests(unittest.TestCase):
         self.assertTrue(self.session.tracker.locked)
         self.assertEqual(self.faces.reference, "A")
 
+    def test_ambiguous_acquisition_discards_provisional_state(self):
+        self.session.update(None, [pose(0.4, "A")], 10.0)
+
+        result = self.session.update(
+            None,
+            [pose(0.47, "A"), pose(0.53, "B")],
+            10.1,
+        )
+
+        self.assertEqual(result.state, SessionState.SEARCHING)
+        self.assertEqual(self.session.acquisition_frame_count, 0)
+        self.assertEqual(self.faces.samples, [])
+
+    def test_disappearing_candidate_restarts_search(self):
+        self.session.update(None, [pose(face="A")], 10.0)
+
+        result = self.session.update(None, [], 10.1)
+
+        self.assertEqual(result.state, SessionState.SEARCHING)
+        self.assertEqual(self.session.acquisition_frame_count, 0)
+        self.assertEqual(self.faces.samples, [])
+
     def test_different_face_cannot_inherit_same_position(self):
         self.auto_lock_a()
 
@@ -96,6 +118,16 @@ class SignerSessionControllerTests(unittest.TestCase):
         self.assertEqual(result.state, SessionState.TEMPORARILY_LOST)
         self.assertIsNone(result.active_signer)
         self.assertTrue(self.session.tracker.locked)
+
+    def test_matching_signer_is_reacquired_after_temporary_loss(self):
+        self.auto_lock_a()
+        lost = self.session.update(None, [pose(face="B")], 10.4)
+
+        reacquired = self.session.update(None, [pose(face="A")], 10.5)
+
+        self.assertEqual(lost.state, SessionState.TEMPORARILY_LOST)
+        self.assertEqual(reacquired.state, SessionState.LOCKED)
+        self.assertIsNotNone(reacquired.active_signer)
 
     def test_ambiguous_face_returns_no_active_signer(self):
         self.auto_lock_a()

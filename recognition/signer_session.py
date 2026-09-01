@@ -11,6 +11,7 @@ from face_identity import FaceEvidence
 SIGNER_LOST_TIMEOUT_SECONDS = 2.0
 ACQUISITION_STABLE_FRAMES = 12
 FACE_REFERENCE_SAMPLE_COUNT = 5
+ACQUISITION_CENTER_AMBIGUITY_MARGIN = 0.05
 TRACK_SMOOTHING = 0.25
 
 
@@ -190,13 +191,33 @@ class SignerSessionController:
         if embedding is not None:
             self.face_verifier.add_acquisition_sample(embedding)
 
+    def _clear_acquisition(self):
+        self.face_verifier.reset_acquisition()
+        self.acquisition_candidate = None
+        self.acquisition_frame_count = 0
+        self.state = SessionState.SEARCHING
+
+    def _acquisition_is_ambiguous(self, observations) -> bool:
+        """Reject acquisition when two candidates are similarly central."""
+        if len(observations) < 2:
+            return False
+        center_distances = sorted(
+            point_distance(item["shoulder_midpoint"], (0.5, 0.5))
+            for item in observations
+        )
+        return (
+            center_distances[1] - center_distances[0]
+            <= ACQUISITION_CENTER_AMBIGUITY_MARGIN
+        )
+
     def _update_acquisition(self, observations, embeddings, current_time):
+        if self._acquisition_is_ambiguous(observations):
+            self._clear_acquisition()
+            return SessionResult(self.state)
+
         candidate = self.tracker.select_candidate(observations)
         if candidate is None:
-            self.face_verifier.reset_acquisition()
-            self.acquisition_candidate = None
-            self.acquisition_frame_count = 0
-            self.state = SessionState.SEARCHING
+            self._clear_acquisition()
             return SessionResult(self.state)
 
         candidate_index = next(
