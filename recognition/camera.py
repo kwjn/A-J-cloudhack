@@ -10,16 +10,16 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
+from face_identity import SessionFaceVerifier
 from landmarks import extract_features
+from signer_session import SessionState, SignerSessionController
 
 
 MODEL_PATH = Path(__file__).resolve().parent / "models" / "hand_landmarker.task"
 POSE_MODEL_PATH = Path(__file__).resolve().parent / "models" / "pose_landmarker.task"
 HAND_CONNECTIONS = vision.HandLandmarksConnections.HAND_CONNECTIONS
 MAX_POSES = 4
-SIGNER_LOST_TIMEOUT_SECONDS = 2.0
 HAND_MEMORY_SECONDS = 0.75
-TRACK_SMOOTHING = 0.25
 POSE_LANDMARK_INDICES = (11, 12, 13, 14, 15, 16)
 POSE_CONNECTIONS = (
     (11, 13),
@@ -98,126 +98,6 @@ def build_pose_observations(pose_results) -> list:
         )
 
     return observations
-
-
-def smooth_point(previous, current):
-    """Apply a small moving average to reduce tracking jitter."""
-    return tuple(
-        old * (1.0 - TRACK_SMOOTHING) + new * TRACK_SMOOTHING
-        for old, new in zip(previous, current)
-    )
-
-
-class PrimarySignerTracker:
-    """Keep a conservative positional lock on one signer."""
-
-    def __init__(self, lost_timeout=SIGNER_LOST_TIMEOUT_SECONDS):
-        self.lost_timeout = lost_timeout
-        self.reset()
-
-    def reset(self) -> None:
-        self.locked = False
-        self.shoulder_midpoint = None
-        self.shoulder_width = None
-        self.body_region = None
-        self.body_center = None
-        self.velocity = (0.0, 0.0)
-        self.last_seen_time = None
-        self.hand_positions = {}
-        self.hand_seen_times = {}
-
-    def select_candidate(self, observations):
-        """Choose the unlocked pose closest to the centre of the frame."""
-        if not observations:
-            return None
-        return min(
-            observations,
-            key=lambda item: point_distance(
-                item["shoulder_midpoint"],
-                (0.5, 0.5),
-            ),
-        )
-
-    def lock(self, observation, current_time) -> None:
-        """Store the selected signer's initial positional track."""
-        self.locked = True
-        self.shoulder_midpoint = observation["shoulder_midpoint"]
-        self.shoulder_width = observation["shoulder_width"]
-        self.body_region = observation["body_region"]
-        self.body_center = observation["body_center"]
-        self.velocity = (0.0, 0.0)
-        self.last_seen_time = current_time
-        self.hand_positions = {}
-        self.hand_seen_times = {}
-
-    def match(self, observations, current_time):
-        """Match only a pose near the predicted locked-signer position."""
-        if not self.locked or self.last_seen_time is None:
-            return None
-
-        if current_time - self.last_seen_time > self.lost_timeout:
-            return None
-
-        predicted_midpoint = (
-            self.shoulder_midpoint[0] + self.velocity[0],
-            self.shoulder_midpoint[1] + self.velocity[1],
-        )
-        maximum_shoulder_distance = max(0.08, self.shoulder_width * 0.80)
-        body_width = self.body_region[2] - self.body_region[0]
-        body_height = self.body_region[3] - self.body_region[1]
-        maximum_body_distance = max(0.15, max(body_width, body_height) * 0.50)
-
-        matches = []
-        for observation in observations:
-            shoulder_distance = point_distance(
-                observation["shoulder_midpoint"],
-                predicted_midpoint,
-            )
-            body_distance = point_distance(
-                observation["body_center"],
-                self.body_center,
-            )
-            scale_ratio = observation["shoulder_width"] / self.shoulder_width
-
-            if shoulder_distance > maximum_shoulder_distance:
-                continue
-            if body_distance > maximum_body_distance:
-                continue
-            if not 0.70 <= scale_ratio <= 1.40:
-                continue
-
-            scale_change = abs(math.log(scale_ratio))
-            score = shoulder_distance + 0.4 * body_distance + 0.1 * scale_change
-            matches.append((score, observation))
-
-        if not matches:
-            return None
-
-        observation = min(matches, key=lambda item: item[0])[1]
-        previous_midpoint = self.shoulder_midpoint
-        self.shoulder_midpoint = smooth_point(
-            self.shoulder_midpoint,
-            observation["shoulder_midpoint"],
-        )
-        movement = (
-            observation["shoulder_midpoint"][0] - previous_midpoint[0],
-            observation["shoulder_midpoint"][1] - previous_midpoint[1],
-        )
-        self.velocity = smooth_point(self.velocity, movement)
-        self.body_center = smooth_point(
-            self.body_center,
-            observation["body_center"],
-        )
-        self.body_region = smooth_point(
-            self.body_region,
-            observation["body_region"],
-        )
-        self.shoulder_width = (
-            self.shoulder_width * (1.0 - TRACK_SMOOTHING)
-            + observation["shoulder_width"] * TRACK_SMOOTHING
-        )
-        self.last_seen_time = current_time
-        return observation
 
 
 def point_to_segment_distance(point, start, end) -> float:
@@ -472,6 +352,7 @@ def show_camera() -> None:
         running_mode=vision.RunningMode.VIDEO,
         num_poses=MAX_POSES,
     )
+    signer_session = SignerSessionController(SessionFaceVerifier())
 
     camera = cv2.VideoCapture(0)
     if not camera.isOpened():
@@ -484,7 +365,7 @@ def show_camera() -> None:
             vision.PoseLandmarker.create_from_options(pose_options) as pose_landmarker,
         ):
             last_timestamp_ms = -1
-            tracker = PrimarySignerTracker()
+            tracker = signer_session.tracker
 
             while True:
                 success, frame = camera.read()
@@ -516,19 +397,14 @@ def show_camera() -> None:
 
                 current_time = time.monotonic()
                 observations = build_pose_observations(pose_results)
-
-                if tracker.locked:
-                    candidate = None
-                    active_signer = tracker.match(observations, current_time)
-                    status_text = (
-                        "Signer locked"
-                        if active_signer is not None
-                        else "Signer lost"
-                    )
-                else:
-                    candidate = tracker.select_candidate(observations)
-                    active_signer = candidate
-                    status_text = "Press L to lock signer"
+                session_result = signer_session.update(
+                    frame,
+                    observations,
+                    current_time,
+                )
+                active_signer = session_result.active_signer
+                candidate = session_result.acquisition_candidate
+                status_text = session_result.state.value.replace("_", " ").title()
 
                 accepted_hands = associate_hands(
                     results,
@@ -539,29 +415,32 @@ def show_camera() -> None:
                 adapted_results = prepare_results_for_features(accepted_hands)
                 features = extract_features(adapted_results, None)
 
-                if active_signer is not None:
+                display_signer = active_signer or candidate
+                if display_signer is not None:
                     signer_color = (
-                        (0, 255, 255) if tracker.locked else (0, 165, 255)
+                        (0, 255, 255)
+                        if session_result.state is SessionState.LOCKED
+                        else (0, 165, 255)
                     )
                     draw_upper_body(
                         frame,
-                        active_signer["landmarks"],
+                        display_signer["landmarks"],
                         signer_color,
                     )
                     body_region = (
                         tracker.body_region
                         if tracker.locked
-                        else active_signer["body_region"]
+                        else display_signer["body_region"]
                     )
                     draw_body_region(frame, body_region, signer_color)
 
-                    for hand in accepted_hands:
-                        draw_hand(
-                            frame,
-                            hand["landmarks"],
-                            hand["handedness"],
-                            hand["side"],
-                        )
+                for hand in accepted_hands:
+                    draw_hand(
+                        frame,
+                        hand["landmarks"],
+                        hand["handedness"],
+                        hand["side"],
+                    )
 
                 cv2.putText(
                     frame,
@@ -590,16 +469,13 @@ def show_camera() -> None:
                     print("Feature vector:", features)
                     print("Vector length:", len(features))
 
-                if key in (ord("l"), ord("L")):
-                    if not tracker.locked and candidate is not None:
-                        tracker.lock(candidate, current_time)
-
                 if key in (ord("r"), ord("R")):
-                    tracker.reset()
+                    signer_session.reset()
 
                 if key in (ord("q"), ord("Q")):
                     break
     finally:
+        signer_session.close()
         camera.release()
         cv2.destroyAllWindows()
 
