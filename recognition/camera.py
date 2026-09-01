@@ -1,142 +1,148 @@
-"""Display a mirrored live feed from the default webcam."""
+"""Display MediaPipe Tasks hand landmarks on a mirrored webcam feed."""
+
+from pathlib import Path
+from types import SimpleNamespace
+import time
 
 import cv2
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
 
 from landmarks import extract_features
 
-POSE_LANDMARKS = (
-    mp.solutions.pose.PoseLandmark.LEFT_SHOULDER.value,
-    mp.solutions.pose.PoseLandmark.RIGHT_SHOULDER.value,
-    mp.solutions.pose.PoseLandmark.LEFT_ELBOW.value,
-    mp.solutions.pose.PoseLandmark.RIGHT_ELBOW.value,
-    mp.solutions.pose.PoseLandmark.LEFT_WRIST.value,
-    mp.solutions.pose.PoseLandmark.RIGHT_WRIST.value,
-)
 
-POSE_CONNECTIONS = (
-    (POSE_LANDMARKS[0], POSE_LANDMARKS[1]),
-    (POSE_LANDMARKS[0], POSE_LANDMARKS[2]),
-    (POSE_LANDMARKS[2], POSE_LANDMARKS[4]),
-    (POSE_LANDMARKS[1], POSE_LANDMARKS[3]),
-    (POSE_LANDMARKS[3], POSE_LANDMARKS[5]),
-)
+MODEL_PATH = Path(__file__).resolve().parent / "models" / "hand_landmarker.task"
+HAND_CONNECTIONS = vision.HandLandmarksConnections.HAND_CONNECTIONS
 
 
-def draw_upper_body_pose(frame, pose_landmarks) -> None:
-    """Draw only the selected shoulders, elbows and wrists."""
+def draw_hand(frame, hand_landmarks, handedness) -> None:
+    """Draw one hand's 21 landmarks, connections and handedness label."""
     height, width = frame.shape[:2]
-    visible_points = {}
+    points = [
+        (int(landmark.x * width), int(landmark.y * height))
+        for landmark in hand_landmarks
+    ]
 
-    for landmark_index in POSE_LANDMARKS:
-        landmark = pose_landmarks.landmark[landmark_index]
-        if landmark.visibility < 0.5:
-            continue
-
-        visible_points[landmark_index] = (
-            int(landmark.x * width),
-            int(landmark.y * height),
+    for connection in HAND_CONNECTIONS:
+        cv2.line(
+            frame,
+            points[connection.start],
+            points[connection.end],
+            (0, 255, 0),
+            2,
         )
 
-    for start, end in POSE_CONNECTIONS:
-        if start in visible_points and end in visible_points:
-            cv2.line(
-                frame,
-                visible_points[start],
-                visible_points[end],
-                (0, 255, 255),
-                2,
-            )
+    for point in points:
+        cv2.circle(frame, point, 4, (0, 0, 255), -1)
 
-    for point in visible_points.values():
-        cv2.circle(frame, point, 5, (0, 255, 255), -1)
+    label = handedness[0].category_name
+    wrist_x, wrist_y = points[0]
+    cv2.putText(
+        frame,
+        label,
+        (max(0, wrist_x - 20), max(30, wrist_y - 10)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.8,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def prepare_results_for_features(results):
+    """Adapt Tasks results for the existing landmark feature extractor."""
+    hand_landmarks = [
+        SimpleNamespace(landmark=landmarks)
+        for landmarks in results.hand_landmarks
+    ]
+    handedness = [
+        SimpleNamespace(
+            classification=[SimpleNamespace(label=categories[0].category_name)]
+        )
+        for categories in results.handedness
+    ]
+    return SimpleNamespace(
+        multi_hand_landmarks=hand_landmarks,
+        multi_handedness=handedness,
+    )
 
 
 def show_camera() -> None:
     """Open the default webcam and display its live video feed."""
-    camera = cv2.VideoCapture(0)
+    if not MODEL_PATH.is_file():
+        raise FileNotFoundError(
+            f"Hand Landmarker model not found: {MODEL_PATH}"
+        )
 
+    options = vision.HandLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=str(MODEL_PATH)),
+        running_mode=vision.RunningMode.VIDEO,
+        num_hands=2,
+    )
+
+    camera = cv2.VideoCapture(0)
     if not camera.isOpened():
         camera.release()
         raise RuntimeError("Could not open the default webcam.")
 
-    hands = mp.solutions.hands.Hands(max_num_hands=2)
-    pose = mp.solutions.pose.Pose()
-    drawing = mp.solutions.drawing_utils
-
     try:
-        while True:
-            success, frame = camera.read()
-            if not success:
-                print("Could not read a frame from the webcam.")
-                break
+        with vision.HandLandmarker.create_from_options(options) as landmarker:
+            last_timestamp_ms = -1
 
-            # Mirror the frame so it behaves like a selfie camera.
-            frame = cv2.flip(frame, 1)
+            while True:
+                success, frame = camera.read()
+                if not success:
+                    print("Could not read a frame from the webcam.")
+                    break
 
-            # MediaPipe expects RGB images, while OpenCV uses BGR.
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            hand_results = hands.process(rgb_frame)
-            pose_results = pose.process(rgb_frame)
+                # Mirror the frame so it behaves like a selfie camera.
+                frame = cv2.flip(frame, 1)
 
-# This fixed-length vector will later be passed to a classifier.
-            features = extract_features(hand_results, pose_results)
+                # MediaPipe Tasks expects an RGB MediaPipe Image.
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(
+                    image_format=mp.ImageFormat.SRGB,
+                    data=rgb_frame,
+                )
 
-            if hand_results.multi_hand_landmarks and hand_results.multi_handedness:
+                # VIDEO mode requires a timestamp that increases every frame.
+                timestamp_ms = max(
+                    time.monotonic_ns() // 1_000_000,
+                    last_timestamp_ms + 1,
+                )
+                last_timestamp_ms = timestamp_ms
+                results = landmarker.detect_for_video(mp_image, timestamp_ms)
+
+                adapted_results = prepare_results_for_features(results)
+                features = extract_features(adapted_results, None)
+
                 for hand_landmarks, handedness in zip(
-                    hand_results.multi_hand_landmarks,
-                    hand_results.multi_handedness,
+                    results.hand_landmarks,
+                    results.handedness,
                 ):
-                    drawing.draw_landmarks(
-                        frame,
-                        hand_landmarks,
-                        mp.solutions.hands.HAND_CONNECTIONS,
-                    )
+                    draw_hand(frame, hand_landmarks, handedness)
 
-                    label = handedness.classification[0].label
-                    wrist = hand_landmarks.landmark[0]
-                    label_position = (
-                        max(0, int(wrist.x * frame.shape[1]) - 20),
-                        max(30, int(wrist.y * frame.shape[0]) - 10),
-                    )
-                    cv2.putText(
-                        frame,
-                        label,
-                        label_position,
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (255, 255, 255),
-                        2,
-                        cv2.LINE_AA,
-                    )
+                cv2.putText(
+                    frame,
+                    "Press Q to quit",
+                    (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.imshow("SgSL Camera", frame)
 
-            if pose_results.pose_landmarks:
-                draw_upper_body_pose(frame, pose_results.pose_landmarks)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (ord("p"), ord("P")):
+                    print("Feature vector:", features)
+                    print("Vector length:", len(features))
 
-            cv2.putText(
-                frame,
-                "Press Q to quit",
-                (20, 40),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.imshow("SgSL Camera", frame)
-
-            # waitKey returns the key pressed while the video window is active.
-            key = cv2.waitKey(1) & 0xFF
-            if key in (ord("p"), ord("P")):
-                print("Feature vector:", features)
-                print("Vector length:", len(features))
-
-            if key in (ord("q"), ord("Q")):
-                break
+                if key in (ord("q"), ord("Q")):
+                    break
     finally:
-        # Always release the webcam and close the window cleanly.
-        hands.close()
-        pose.close()
         camera.release()
         cv2.destroyAllWindows()
 
