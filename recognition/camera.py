@@ -3,6 +3,8 @@
 import cv2
 import mediapipe as mp
 
+from landmarks import extract_hand_features
+
 
 def show_camera() -> None:
     """Open the default webcam and display its live video feed."""
@@ -28,6 +30,9 @@ def show_camera() -> None:
             # MediaPipe expects RGB images, while OpenCV uses BGR.
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = hands.process(rgb_frame)
+
+            # This fixed-length vector will later be passed to a classifier.
+            _features = extract_hand_features(results)
 
             if results.multi_hand_landmarks and results.multi_handedness:
                 for hand_landmarks, handedness in zip(
