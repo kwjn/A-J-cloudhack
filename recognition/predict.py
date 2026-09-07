@@ -2,6 +2,7 @@
 
 from pathlib import Path
 from types import SimpleNamespace
+import sys
 import time
 
 import cv2
@@ -31,6 +32,13 @@ from intents import INTENTS
 from landmarks import extract_features
 from signer_session import SessionState, SignerSessionController
 from train import FEATURE_DIM, FEATURE_VERSION, FIXED_FRAMES, resample_sequence
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from services.recognition_bridge import publish_prediction
 
 
 MODEL_PATH = (
@@ -220,6 +228,11 @@ def finish_capture(artifact, feature_frames, valid_mask):
     try:
         result = classify_sequence(artifact, feature_frames)
         print_prediction_result(artifact, feature_frames, result)
+        try:
+            result = publish_prediction(result)
+            print(f"Published prediction ID: {result['prediction_id']}")
+        except OSError as error:
+            print(f"Warning: could not publish prediction: {error}")
         return result, None
     except (ValueError, RuntimeError) as error:
         print(f"Classification failed: {error}")
