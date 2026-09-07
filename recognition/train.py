@@ -1,4 +1,4 @@
-"""Train a temporary ALLERGY-versus-PACK SgSL smoke-test classifier."""
+"""Train and evaluate the final eight-intent SgSL classifier."""
 
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -17,8 +17,10 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
+from intents import INTENTS
 
-CLASS_LABELS = ("ALLERGY", "PACK")
+
+CLASS_LABELS = tuple(INTENTS)
 FEATURE_DIM = 144
 FEATURE_VERSION = "v1"
 FIXED_FRAMES = 30
@@ -28,7 +30,7 @@ RANDOM_SEED = 42
 
 BASE_DIRECTORY = Path(__file__).resolve().parent
 DATA_DIRECTORY = BASE_DIRECTORY / "data"
-MODEL_PATH = BASE_DIRECTORY / "models" / "sgsl_classifier_test.joblib"
+MODEL_PATH = BASE_DIRECTORY / "models" / "sgsl_classifier.joblib"
 
 
 def warning(path: Path, reason: str) -> None:
@@ -46,7 +48,7 @@ def scalar_value(archive, key: str):
     return value.item()
 
 
-def load_sample(path: Path):
+def load_sample(path: Path, expected_intent=None):
     """Load and validate one temporal feature sample."""
     try:
         with np.load(path, allow_pickle=False) as archive:
@@ -76,6 +78,15 @@ def load_sample(path: Path):
                 raise ValueError(
                     f"feature_version is {stored_feature_version!r}, "
                     f"expected {FEATURE_VERSION!r}"
+                )
+
+            stored_intent = str(scalar_value(archive, "intent"))
+            if stored_intent not in CLASS_LABELS:
+                raise ValueError(f"unsupported intent {stored_intent!r}")
+            if expected_intent is not None and stored_intent != expected_intent:
+                raise ValueError(
+                    f"stored intent is {stored_intent!r}, "
+                    f"expected {expected_intent!r}"
                 )
 
             if not np.issubdtype(features.dtype, np.number):
@@ -117,26 +128,43 @@ def resample_sequence(
 
 
 def load_dataset(data_directory: Path = DATA_DIRECTORY):
-    """Load only the two temporary smoke-test classes."""
+    """Load every supported intent and report dataset statistics."""
     examples = []
     labels = []
+    example_signers = []
     signer_ids = defaultdict(set)
     usable_counts = Counter()
+    skipped_counts = Counter()
+    frame_counts = defaultdict(list)
 
     for label in CLASS_LABELS:
         class_directory = data_directory / label
         for path in sorted(class_directory.glob("*.npz")):
-            loaded = load_sample(path)
+            loaded = load_sample(path, expected_intent=label)
             if loaded is None:
+                skipped_counts[label] += 1
                 continue
             features, signer_id = loaded
             examples.append(resample_sequence(features).reshape(-1))
             labels.append(label)
+            example_signers.append(signer_id)
             usable_counts[label] += 1
+            frame_counts[label].append(features.shape[0])
             if signer_id:
                 signer_ids[label].add(signer_id)
 
-        print(f"{label} usable samples: {usable_counts[label]}")
+        counts = frame_counts[label]
+        frame_summary = (
+            f"min={min(counts)}, average={np.mean(counts):.2f}, max={max(counts)}"
+            if counts
+            else "unavailable"
+        )
+        represented = ", ".join(sorted(signer_ids[label])) or "not recorded"
+        print(
+            f"{label}: usable={usable_counts[label]}, "
+            f"skipped={skipped_counts[label]}, signers={represented}, "
+            f"frames({frame_summary})"
+        )
         if usable_counts[label] < MIN_SAMPLES_PER_CLASS:
             raise RuntimeError(
                 f"{label} needs at least {MIN_SAMPLES_PER_CLASS} usable "
@@ -146,33 +174,17 @@ def load_dataset(data_directory: Path = DATA_DIRECTORY):
     return (
         np.asarray(examples, dtype=np.float32),
         np.asarray(labels),
+        np.asarray(example_signers, dtype=object),
         usable_counts,
         signer_ids,
+        skipped_counts,
+        frame_counts,
     )
 
 
-def train() -> None:
-    """Train, evaluate, report, and save the temporary classifier."""
-    examples, labels, usable_counts, signer_ids = load_dataset()
-
-    print(f"Fixed temporal frames: {FIXED_FRAMES}")
-    for label in CLASS_LABELS:
-        represented = ", ".join(sorted(signer_ids[label])) or "not recorded"
-        print(f"{label} signer IDs: {represented}")
-
-    training_examples, test_examples, training_labels, test_labels = (
-        train_test_split(
-            examples,
-            labels,
-            test_size=TEST_SIZE,
-            random_state=RANDOM_SEED,
-            stratify=labels,
-        )
-    )
-    print(f"Training size: {len(training_labels)}")
-    print(f"Test size: {len(test_labels)}")
-
-    model = Pipeline(
+def build_model() -> Pipeline:
+    """Create the same standardized calibrated RBF SVM used in smoke testing."""
+    return Pipeline(
         steps=(
             ("scaler", StandardScaler()),
             (
@@ -189,32 +201,174 @@ def train() -> None:
             ),
         )
     )
-    model.fit(training_examples, training_labels)
-    predictions = model.predict(test_examples)
 
+
+def signer_aware_split(labels, signers):
+    """Return a valid unseen-signer split, or None when classes would be lost."""
+    required_classes = set(CLASS_LABELS)
+    candidates = []
+    for signer in sorted({item for item in signers if item}):
+        test_indices = np.flatnonzero(signers == signer)
+        train_indices = np.flatnonzero(signers != signer)
+        if (
+            set(labels[test_indices]) == required_classes
+            and set(labels[train_indices]) == required_classes
+        ):
+            candidates.append((len(test_indices), signer, train_indices, test_indices))
+    if not candidates:
+        return None
+    _, signer, train_indices, test_indices = max(candidates)
+    return train_indices, test_indices, signer
+
+
+def print_evaluation(test_labels, predictions) -> dict:
+    """Print overall, per-intent, confusion, strongest, and weakest results."""
     accuracy = accuracy_score(test_labels, predictions)
-    precision, recall, f1, _ = precision_recall_fscore_support(
+    macro_precision, macro_recall, macro_f1, _ = (
+        precision_recall_fscore_support(
+            test_labels,
+            predictions,
+            labels=CLASS_LABELS,
+            average="macro",
+            zero_division=0,
+        )
+    )
+    precision, recall, f1, support = precision_recall_fscore_support(
         test_labels,
         predictions,
         labels=CLASS_LABELS,
-        average="macro",
+        average=None,
         zero_division=0,
     )
     matrix = confusion_matrix(test_labels, predictions, labels=CLASS_LABELS)
 
-    print(f"Accuracy: {accuracy:.3f}")
-    print(f"Macro precision: {precision:.3f}")
-    print(f"Macro recall: {recall:.3f}")
-    print(f"Macro F1: {f1:.3f}")
-    print(f"Confusion matrix (rows=true, columns=predicted; {CLASS_LABELS}):")
+    print(f"Overall accuracy: {accuracy:.3f}")
+    print(f"Macro precision: {macro_precision:.3f}")
+    print(f"Macro recall: {macro_recall:.3f}")
+    print(f"Macro F1: {macro_f1:.3f}")
+    print("Per-intent metrics:")
+    for index, label in enumerate(CLASS_LABELS):
+        print(
+            f"  {label}: precision={precision[index]:.3f}, "
+            f"recall={recall[index]:.3f}, F1={f1[index]:.3f}, "
+            f"support={int(support[index])}"
+        )
+
+    print(f"Confusion matrix order: {CLASS_LABELS}")
     print(matrix)
+
+    best_f1 = float(np.max(f1))
+    weakest_f1 = float(np.min(f1))
+    best = [CLASS_LABELS[index] for index in np.flatnonzero(f1 == best_f1)]
+    weakest = [
+        CLASS_LABELS[index] for index in np.flatnonzero(f1 == weakest_f1)
+    ]
+    print(f"Best-performing intents (F1={best_f1:.3f}): {', '.join(best)}")
+    print(f"Weakest intents (F1={weakest_f1:.3f}): {', '.join(weakest)}")
+
+    confused_pairs = []
+    for true_index, true_label in enumerate(CLASS_LABELS):
+        for predicted_index, predicted_label in enumerate(CLASS_LABELS):
+            if true_index == predicted_index or matrix[true_index, predicted_index] == 0:
+                continue
+            confused_pairs.append(
+                (
+                    int(matrix[true_index, predicted_index]),
+                    true_label,
+                    predicted_label,
+                )
+            )
+    confused_pairs.sort(reverse=True)
+    if confused_pairs:
+        highest_count = confused_pairs[0][0]
+        common = [item for item in confused_pairs if item[0] == highest_count]
+        print(
+            "Most common confusions: "
+            + ", ".join(
+                f"{true_label} -> {predicted_label} ({count})"
+                for count, true_label, predicted_label in common
+            )
+        )
+    else:
+        print("Most common confusions: none in this test split")
+
+    return {
+        "accuracy": float(accuracy),
+        "macro_precision": float(macro_precision),
+        "macro_recall": float(macro_recall),
+        "macro_f1": float(macro_f1),
+        "per_intent": {
+            label: {
+                "precision": float(precision[index]),
+                "recall": float(recall[index]),
+                "f1": float(f1[index]),
+                "support": int(support[index]),
+            }
+            for index, label in enumerate(CLASS_LABELS)
+        },
+        "confusion_matrix": matrix.tolist(),
+        "confusion_matrix_labels": list(CLASS_LABELS),
+        "best_intents": best,
+        "weakest_intents": weakest,
+    }
+
+
+def train() -> None:
+    """Train, evaluate, and save the final eight-intent classifier."""
+    (
+        examples,
+        labels,
+        example_signers,
+        usable_counts,
+        signer_ids,
+        skipped_counts,
+        frame_counts,
+    ) = load_dataset()
+
+    print(f"Total usable samples: {len(labels)}")
+    print(f"Total malformed/skipped samples: {sum(skipped_counts.values())}")
+    print(f"Fixed temporal frames: {FIXED_FRAMES}")
+
+    split = signer_aware_split(labels, example_signers)
+    if split is not None:
+        train_indices, test_indices, held_out_signer = split
+        evaluation_strategy = f"unseen-signer evaluation (held out {held_out_signer})"
+    else:
+        all_indices = np.arange(len(labels))
+        train_indices, test_indices = train_test_split(
+            all_indices,
+            test_size=TEST_SIZE,
+            random_state=RANDOM_SEED,
+            stratify=labels,
+        )
+        held_out_signer = None
+        evaluation_strategy = "same-signer / same-dataset evaluation"
+
+    training_examples = examples[train_indices]
+    test_examples = examples[test_indices]
+    training_labels = labels[train_indices]
+    test_labels = labels[test_indices]
+    print(f"Evaluation strategy: {evaluation_strategy}")
+    print(f"Training size: {len(training_labels)}")
+    print(f"Test size: {len(test_labels)}")
+
+    evaluation_model = build_model()
+    evaluation_model.fit(training_examples, training_labels)
+    predictions = evaluation_model.predict(test_examples)
+    metrics = print_evaluation(test_labels, predictions)
     print(
-        "Warning: this same-dataset split is only a smoke test; its metrics "
-        "are not evidence of generalisation to unseen signers."
+        "Warning: these metrics are not evidence of unseen-signer "
+        "generalisation."
+        if held_out_signer is None
+        else "Evaluation used a signer excluded from training."
     )
 
+    print("Fitting final saved model on all usable samples...")
+    model = build_model()
+    model.fit(examples, labels)
+    model_classes = [str(label) for label in model.classes_]
     artifact = {
-        "artifact_type": "temporary_two_intent_smoke_test",
+        "artifact_type": "final_eight_intent_classifier",
         "model": model,
         "classifier": model.named_steps["classifier"],
         "scaler": model.named_steps["scaler"],
@@ -226,13 +380,28 @@ def train() -> None:
         "fixed_frame_count": FIXED_FRAMES,
         "feature_dimension": FEATURE_DIM,
         "feature_version": FEATURE_VERSION,
-        "class_labels": list(CLASS_LABELS),
+        "class_labels": model_classes,
+        "supported_intents": list(CLASS_LABELS),
         "random_seed": RANDOM_SEED,
         "usable_sample_counts": dict(usable_counts),
+        "skipped_sample_counts": dict(skipped_counts),
+        "signer_ids": {
+            label: sorted(signer_ids[label]) for label in CLASS_LABELS
+        },
+        "frame_count_statistics": {
+            label: {
+                "minimum": min(frame_counts[label]),
+                "average": float(np.mean(frame_counts[label])),
+                "maximum": max(frame_counts[label]),
+            }
+            for label in CLASS_LABELS
+        },
+        "evaluation_strategy": evaluation_strategy,
+        "evaluation_metrics": metrics,
     }
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(artifact, MODEL_PATH)
-    print(f"Saved temporary model: {MODEL_PATH}")
+    print(f"Saved final model: {MODEL_PATH}")
 
 
 if __name__ == "__main__":
