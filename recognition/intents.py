@@ -2,54 +2,29 @@
 
 
 INTENTS = {
-    "DEAF": {
-        "intent_id": "DEAF",
-        "english": "I am Deaf and I use sign language.",
+    "ALLERGY": {
+        "intent_id": "ALLERGY",
+        "english": "I am allergic to this.",
+        "critical": True,
+    },
+    "VEGETARIAN": {
+        "intent_id": "VEGETARIAN",
+        "english": "Is this vegetarian?",
         "critical": False,
     },
-    "HELP": {
-        "intent_id": "HELP",
-        "english": "I need help.",
+    "NO_SPICY": {
+        "intent_id": "NO_SPICY",
+        "english": "Please make it not spicy.",
         "critical": False,
     },
-    "YES": {
-        "intent_id": "YES",
-        "english": "Yes.",
+    "WRONG_ORDER": {
+        "intent_id": "WRONG_ORDER",
+        "english": "This is not what I ordered.",
         "critical": False,
     },
-    "NO": {
-        "intent_id": "NO",
-        "english": "No.",
-        "critical": False,
-    },
-    "DOCTOR": {
-        "intent_id": "DOCTOR",
-        "english": "I need a doctor.",
-        "critical": False,
-    },
-    "PAIN": {
-        "intent_id": "PAIN",
-        "english": "I am in pain.",
-        "critical": False,
-    },
-    "DIZZY": {
-        "intent_id": "DIZZY",
-        "english": "I feel dizzy.",
-        "critical": False,
-    },
-    "REPEAT": {
-        "intent_id": "REPEAT",
-        "english": "Please repeat that.",
-        "critical": False,
-    },
-    "TOILET": {
-        "intent_id": "TOILET",
-        "english": "Where is the toilet?",
-        "critical": False,
-    },
-    "APPOINTMENT": {
-        "intent_id": "APPOINTMENT",
-        "english": "I have an appointment.",
+    "HAVENT_RECEIVED_ORDER": {
+        "intent_id": "HAVENT_RECEIVED_ORDER",
+        "english": "I haven't received my order yet.",
         "critical": False,
     },
 }

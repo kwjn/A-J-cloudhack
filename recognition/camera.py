@@ -413,7 +413,16 @@ def show_camera() -> None:
                     current_time,
                 )
                 adapted_results = prepare_results_for_features(accepted_hands)
-                features = extract_features(adapted_results, None)
+                adapted_pose = (
+                    SimpleNamespace(
+                        pose_landmarks=SimpleNamespace(
+                            landmark=active_signer["landmarks"]
+                        )
+                    )
+                    if active_signer is not None
+                    else None
+                )
+                features = extract_features(adapted_results, adapted_pose)
 
                 display_signer = active_signer or candidate
                 if display_signer is not None:
