@@ -4,7 +4,7 @@
 INTENTS = {
     "ALLERGY": {
         "intent_id": "ALLERGY",
-        "english": "I am allergic to this.",
+        "english": "I have a food allergy.",
         "critical": True,
     },
     "VEGETARIAN": {
@@ -12,9 +12,14 @@ INTENTS = {
         "english": "Is this vegetarian?",
         "critical": False,
     },
-    "NO_SPICY": {
-        "intent_id": "NO_SPICY",
-        "english": "Please make it not spicy.",
+    "CONTAINS_PORK": {
+        "intent_id": "CONTAINS_PORK",
+        "english": "Does this contain pork?",
+        "critical": False,
+    },
+    "HOW_MUCH": {
+        "intent_id": "HOW_MUCH",
+        "english": "How much is this?",
         "critical": False,
     },
     "WRONG_ORDER": {
@@ -22,9 +27,19 @@ INTENTS = {
         "english": "This is not what I ordered.",
         "critical": False,
     },
-    "HAVENT_RECEIVED_ORDER": {
-        "intent_id": "HAVENT_RECEIVED_ORDER",
-        "english": "I haven't received my order yet.",
+    "NOT_RECEIVED": {
+        "intent_id": "NOT_RECEIVED",
+        "english": "I haven't received my food yet.",
+        "critical": False,
+    },
+    "PLEASE_REPEAT": {
+        "intent_id": "PLEASE_REPEAT",
+        "english": "Please repeat that.",
+        "critical": False,
+    },
+    "TAKEAWAY": {
+        "intent_id": "TAKEAWAY",
+        "english": "Takeaway, please.",
         "critical": False,
     },
 }
