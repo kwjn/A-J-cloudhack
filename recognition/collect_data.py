@@ -3,6 +3,7 @@
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 from types import SimpleNamespace
 import time
 
@@ -37,6 +38,15 @@ MAX_CAPTURED_FRAMES = 300
 MIN_VALID_FRAME_PROPORTION = 0.80
 
 
+def signer_id_argument(value):
+    """Validate a short anonymized dataset signer ID."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,16}", value):
+        raise argparse.ArgumentTypeError(
+            "signer ID must be 1-16 letters, numbers, underscores, or hyphens"
+        )
+    return value
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Record one temporal SgSL training sample at a time."
@@ -46,6 +56,12 @@ def parse_args():
         required=True,
         choices=tuple(INTENTS),
         help="Semantic intent ID. Valid values: " + ", ".join(INTENTS),
+    )
+    parser.add_argument(
+        "--signer",
+        required=True,
+        type=signer_id_argument,
+        help="Short anonymized signer ID, for example A, B, C, or D.",
     )
     return parser.parse_args()
 
@@ -86,6 +102,7 @@ def sample_rejection_reason(valid_mask):
 
 def save_sample(
     intent,
+    signer_id,
     feature_frames,
     valid_mask,
     sample_number,
@@ -113,6 +130,7 @@ def save_sample(
     np.savez_compressed(
         output_path,
         intent=np.array(intent),
+        signer_id=np.array(signer_id),
         features=features,
         frame_count=np.array(frame_count, dtype=np.int64),
         valid_frame_count=np.array(valid_frame_count, dtype=np.int64),
@@ -142,7 +160,7 @@ def draw_status_lines(frame, lines):
         )
 
 
-def collect_data(intent, data_directory=DATA_DIRECTORY):
+def collect_data(intent, signer_id, data_directory=DATA_DIRECTORY):
     """Open the webcam and deliberately record labelled temporal samples."""
     if not MODEL_PATH.is_file():
         raise FileNotFoundError(f"Hand Landmarker model not found: {MODEL_PATH}")
@@ -240,6 +258,7 @@ def collect_data(intent, data_directory=DATA_DIRECTORY):
                     if len(feature_frames) >= MAX_CAPTURED_FRAMES:
                         output_path, reason = save_sample(
                             intent,
+                            signer_id,
                             feature_frames,
                             valid_mask,
                             sample_number,
@@ -280,7 +299,8 @@ def collect_data(intent, data_directory=DATA_DIRECTORY):
                     frame,
                     (
                         f"Intent: {intent}",
-                        f"Signer: {session_result.state.value}",
+                        f"Signer ID: {signer_id}",
+                        f"Signer state: {session_result.state.value}",
                         "Recorder: " + ("RECORDING" if recording else "READY"),
                         f"Sample: {sample_number:04d}",
                         f"Frames: {len(feature_frames)} "
@@ -297,6 +317,7 @@ def collect_data(intent, data_directory=DATA_DIRECTORY):
                     if recording:
                         output_path, reason = save_sample(
                             intent,
+                            signer_id,
                             feature_frames,
                             valid_mask,
                             sample_number,
@@ -343,4 +364,4 @@ def collect_data(intent, data_directory=DATA_DIRECTORY):
 
 if __name__ == "__main__":
     arguments = parse_args()
-    collect_data(arguments.intent)
+    collect_data(arguments.intent, arguments.signer)
