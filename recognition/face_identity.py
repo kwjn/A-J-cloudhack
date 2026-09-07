@@ -17,7 +17,7 @@ FACE_ASSOCIATION_SHOULDER_WIDTHS = 1.25
 MODEL_DIRECTORY = Path(__file__).resolve().parent / "models"
 FACE_DETECTOR_MODEL_PATH = MODEL_DIRECTORY / "face_detection_yunet_2026may.onnx"
 FACE_RECOGNIZER_MODEL_PATH = (
-    MODEL_DIRECTORY / "face_recognition_sface_2021dec_int8bq.onnx"
+    MODEL_DIRECTORY / "face_recognition_sface_2021dec.onnx"
 )
 
 

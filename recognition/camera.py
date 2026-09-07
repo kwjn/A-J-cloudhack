@@ -28,7 +28,7 @@ POSE_CONNECTIONS = (
     (14, 16),
     (11, 12),
 )
-POSE_WRIST_INDICES = {"Left": 15, "Right": 16}
+POSE_WRIST_INDICES = {"Left": 16, "Right": 15}
 
 
 def point_distance(first, second) -> float:
@@ -154,8 +154,8 @@ def associate_hands(results, signer, tracker, current_time) -> list:
 
         side_scores = []
         for side, shoulder_index, elbow_index in (
-            ("Left", 11, 13),
-            ("Right", 12, 14),
+            ("Left", 12, 14),
+            ("Right", 11, 13),
         ):
             shoulder = pose_landmarks[shoulder_index]
             elbow = pose_landmarks[elbow_index]
