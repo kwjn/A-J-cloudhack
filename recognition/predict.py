@@ -1,6 +1,5 @@
-"""Live manual-capture prediction for the temporary two-intent model."""
+"""Live manual-capture prediction for the final eight-intent model."""
 
-import json
 from pathlib import Path
 from types import SimpleNamespace
 import time
@@ -31,27 +30,27 @@ from face_identity import SessionFaceVerifier
 from intents import INTENTS
 from landmarks import extract_features
 from signer_session import SessionState, SignerSessionController
-from train import FEATURE_DIM, FEATURE_VERSION, resample_sequence
+from train import FEATURE_DIM, FEATURE_VERSION, FIXED_FRAMES, resample_sequence
 
 
 MODEL_PATH = (
     Path(__file__).resolve().parent
     / "models"
-    / "sgsl_classifier_test.joblib"
+    / "sgsl_classifier.joblib"
 )
-EXPECTED_CLASSES = ("ALLERGY", "PACK")
+EXPECTED_CLASSES = tuple(sorted(INTENTS))
 
 
 def load_model_artifact(model_path=MODEL_PATH) -> dict:
-    """Load and validate the temporary model and preprocessing contract."""
+    """Load and validate the final model and preprocessing contract."""
     model_path = Path(model_path)
     if not model_path.is_file():
-        raise FileNotFoundError(f"Temporary classifier not found: {model_path}")
+        raise FileNotFoundError(f"Final classifier not found: {model_path}")
 
     try:
         artifact = joblib.load(model_path)
     except Exception as error:
-        raise RuntimeError(f"Could not load temporary classifier: {model_path}") from error
+        raise RuntimeError(f"Could not load final classifier: {model_path}") from error
 
     if not isinstance(artifact, dict):
         raise ValueError("Model artifact must be a dictionary.")
@@ -91,7 +90,7 @@ def load_model_artifact(model_path=MODEL_PATH) -> dict:
     fixed_frames = preprocessing.get("fixed_frames")
     if fixed_frames != artifact["fixed_frame_count"] or not isinstance(
         fixed_frames, int
-    ) or fixed_frames < 1:
+    ) or fixed_frames != FIXED_FRAMES:
         raise ValueError("Model fixed-frame preprocessing metadata is invalid.")
 
     model = artifact["model"]
@@ -103,7 +102,7 @@ def load_model_artifact(model_path=MODEL_PATH) -> dict:
         raise ValueError("Artifact and classifier class ordering do not match.")
     if set(model_classes) != set(EXPECTED_CLASSES):
         raise ValueError(
-            f"Temporary classifier classes must be {EXPECTED_CLASSES}; "
+            f"Final classifier classes must be {EXPECTED_CLASSES}; "
             f"found {model_classes}."
         )
     if any(label not in INTENTS for label in model_classes):
@@ -187,18 +186,26 @@ def print_capture_shape_diagnostics(artifact, feature_frames, valid_mask) -> Non
     print(f"Body slot all-zero frames: {body_absent}/{captured_count}")
 
 
-def print_probability_diagnostics(artifact, feature_frames) -> None:
-    """Print classifier ordering, every probability, and final class."""
+def print_prediction_result(artifact, feature_frames, result) -> None:
+    """Print metadata and the three highest class probabilities."""
     model_input = preprocess_sequence(artifact, feature_frames)
     model = artifact["model"]
     model_classes = [str(label) for label in model.classes_]
     probabilities = model.predict_proba(model_input)[0]
-    predicted_intent = str(model.predict(model_input)[0])
 
     print(f"classifier.classes_: {model_classes}")
-    for class_index, class_label in enumerate(model_classes):
-        print(f"Probability {class_label}: {float(probabilities[class_index]):.6f}")
-    print(f"Final predicted class: {predicted_intent}")
+    print(f"PREDICTION: {result['intent']}")
+    print(f"CONFIDENCE: {result['confidence']:.4f}")
+    print(f"TEXT: {result['text']}")
+    print(f"CRITICAL: {str(result['critical']).lower()}")
+    print("Top predictions:")
+    ranked_predictions = sorted(
+        zip(model_classes, probabilities),
+        key=lambda item: float(item[1]),
+        reverse=True,
+    )
+    for class_label, probability in ranked_predictions[:3]:
+        print(f"{class_label:<18} {float(probability):.6f}")
     print("--- END LIVE SEQUENCE DEBUG ---")
 
 
@@ -212,7 +219,7 @@ def finish_capture(artifact, feature_frames, valid_mask):
         return None, rejection_reason
     try:
         result = classify_sequence(artifact, feature_frames)
-        print_probability_diagnostics(artifact, feature_frames)
+        print_prediction_result(artifact, feature_frames, result)
         return result, None
     except (ValueError, RuntimeError) as error:
         print(f"Classification failed: {error}")
@@ -238,7 +245,7 @@ def draw_status_lines(frame, lines) -> None:
 def show_live_prediction() -> None:
     """Open the webcam and classify deliberately captured sign sequences."""
     artifact = load_model_artifact()
-    print("Loaded temporary classes:", ", ".join(artifact["class_labels"]))
+    print("Loaded final classes:", ", ".join(artifact["class_labels"]))
 
     if not HAND_MODEL_PATH.is_file():
         raise FileNotFoundError(f"Hand Landmarker model not found: {HAND_MODEL_PATH}")
@@ -351,11 +358,7 @@ def show_live_prediction() -> None:
                             if reason
                             else f"PREDICTION: {last_result['intent']}"
                         )
-                        if last_result:
-                            print(f"PREDICTION: {last_result['intent']}")
-                            print(f"CONFIDENCE: {last_result['confidence']:.4f}")
-                            print(json.dumps(last_result))
-                        else:
+                        if not last_result:
                             print(status_message)
                         feature_frames = []
                         valid_mask = []
@@ -415,11 +418,7 @@ def show_live_prediction() -> None:
                             if reason
                             else f"PREDICTION: {last_result['intent']}"
                         )
-                        if last_result:
-                            print(f"PREDICTION: {last_result['intent']}")
-                            print(f"CONFIDENCE: {last_result['confidence']:.4f}")
-                            print(json.dumps(last_result))
-                        else:
+                        if not last_result:
                             print(status_message)
                         feature_frames = []
                         valid_mask = []
