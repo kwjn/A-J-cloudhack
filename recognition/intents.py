@@ -37,9 +37,9 @@ INTENTS = {
         "english": "Please repeat that.",
         "critical": False,
     },
-    "TAKEAWAY": {
-        "intent_id": "TAKEAWAY",
-        "english": "Takeaway, please.",
+    "PACK": {
+        "intent_id": "PACK",
+        "english": "Please pack this.",
         "critical": False,
     },
 }

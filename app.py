@@ -39,8 +39,8 @@ MOCK_INTENTS = {
         "text": "Please repeat that.",
         "critical": False,
     },
-    "TAKEAWAY": {
-        "text": "Takeaway, please.",
+    "PACK": {
+        "text": "Please pack this.",
         "critical": False,
     },
 }
