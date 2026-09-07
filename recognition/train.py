@@ -27,6 +27,7 @@ FIXED_FRAMES = 30
 MIN_SAMPLES_PER_CLASS = 5
 TEST_SIZE = 0.33
 RANDOM_SEED = 42
+CALIBRATION_FOLDS = 3
 
 BASE_DIRECTORY = Path(__file__).resolve().parent
 DATA_DIRECTORY = BASE_DIRECTORY / "data"
@@ -196,29 +197,46 @@ def build_model() -> Pipeline:
                         random_state=RANDOM_SEED,
                     ),
                     method="sigmoid",
-                    cv=3,
+                    cv=CALIBRATION_FOLDS,
                 ),
             ),
         )
     )
 
 
-def signer_aware_split(labels, signers):
-    """Return a valid unseen-signer split, or None when classes would be lost."""
+def signer_aware_splits(labels, signers):
+    """Return valid unseen-signer splits and reasons skipped splits are unsafe."""
     required_classes = set(CLASS_LABELS)
-    candidates = []
+    valid_splits = []
+    skipped_splits = {}
     for signer in sorted({item for item in signers if item}):
         test_indices = np.flatnonzero(signers == signer)
         train_indices = np.flatnonzero(signers != signer)
-        if (
-            set(labels[test_indices]) == required_classes
-            and set(labels[train_indices]) == required_classes
-        ):
-            candidates.append((len(test_indices), signer, train_indices, test_indices))
-    if not candidates:
-        return None
-    _, signer, train_indices, test_indices = max(candidates)
-    return train_indices, test_indices, signer
+        missing_test_classes = required_classes.difference(labels[test_indices])
+        missing_train_classes = required_classes.difference(labels[train_indices])
+        if missing_test_classes or missing_train_classes:
+            skipped_splits[signer] = (
+                "missing test classes " + ", ".join(sorted(missing_test_classes))
+                if missing_test_classes
+                else "missing training classes "
+                + ", ".join(sorted(missing_train_classes))
+            )
+            continue
+
+        training_counts = Counter(labels[train_indices])
+        too_small = [
+            label
+            for label in CLASS_LABELS
+            if training_counts[label] < CALIBRATION_FOLDS
+        ]
+        if too_small:
+            skipped_splits[signer] = (
+                f"training side has fewer than {CALIBRATION_FOLDS} samples for "
+                + ", ".join(too_small)
+            )
+            continue
+        valid_splits.append((train_indices, test_indices, signer))
+    return valid_splits, skipped_splits
 
 
 def print_evaluation(test_labels, predictions) -> dict:
@@ -329,43 +347,71 @@ def train() -> None:
     print(f"Total malformed/skipped samples: {sum(skipped_counts.values())}")
     print(f"Fixed temporal frames: {FIXED_FRAMES}")
 
-    split = signer_aware_split(labels, example_signers)
-    if split is not None:
-        train_indices, test_indices, held_out_signer = split
-        evaluation_strategy = f"unseen-signer evaluation (held out {held_out_signer})"
-    else:
-        all_indices = np.arange(len(labels))
-        train_indices, test_indices = train_test_split(
-            all_indices,
-            test_size=TEST_SIZE,
-            random_state=RANDOM_SEED,
-            stratify=labels,
-        )
-        held_out_signer = None
-        evaluation_strategy = "same-signer / same-dataset evaluation"
-
+    all_indices = np.arange(len(labels))
+    train_indices, test_indices = train_test_split(
+        all_indices,
+        test_size=TEST_SIZE,
+        random_state=RANDOM_SEED,
+        stratify=labels,
+    )
     training_examples = examples[train_indices]
     test_examples = examples[test_indices]
     training_labels = labels[train_indices]
     test_labels = labels[test_indices]
-    print(f"Evaluation strategy: {evaluation_strategy}")
+    evaluation_strategy = "same-signer / same-dataset stratified evaluation"
+    print(f"\nEvaluation strategy: {evaluation_strategy}")
     print(f"Training size: {len(training_labels)}")
     print(f"Test size: {len(test_labels)}")
 
     evaluation_model = build_model()
     evaluation_model.fit(training_examples, training_labels)
     predictions = evaluation_model.predict(test_examples)
-    metrics = print_evaluation(test_labels, predictions)
+    stratified_metrics = print_evaluation(test_labels, predictions)
     print(
         "Warning: these metrics are not evidence of unseen-signer "
         "generalisation."
-        if held_out_signer is None
-        else "Evaluation used a signer excluded from training."
     )
 
-    print("Fitting final saved model on all usable samples...")
+    unseen_signer_metrics = {}
+    valid_splits, skipped_splits = signer_aware_splits(labels, example_signers)
+    for held_out_signer, reason in skipped_splits.items():
+        print(f"\nUnseen-signer evaluation held out {held_out_signer}: SKIPPED")
+        print(f"Reason: {reason}")
+    for signer_train_indices, signer_test_indices, held_out_signer in valid_splits:
+        print(f"\nUnseen-signer evaluation: held out signer {held_out_signer}")
+        print(f"Training size: {len(signer_train_indices)}")
+        print(f"Test size: {len(signer_test_indices)}")
+        signer_model = build_model()
+        signer_model.fit(examples[signer_train_indices], labels[signer_train_indices])
+        signer_predictions = signer_model.predict(examples[signer_test_indices])
+        unseen_signer_metrics[held_out_signer] = print_evaluation(
+            labels[signer_test_indices],
+            signer_predictions,
+        )
+
+    represented_signers = {item for item in example_signers if item}
+    if "C" in represented_signers:
+        final_indices = np.flatnonzero(np.isin(example_signers, ("A", "B")))
+        final_training_description = "signers A and B; signer C reserved"
+    else:
+        final_indices = all_indices
+        final_training_description = "all usable samples"
+
+    final_counts = Counter(labels[final_indices])
+    insufficient_final_classes = [
+        label
+        for label in CLASS_LABELS
+        if final_counts[label] < CALIBRATION_FOLDS
+    ]
+    if insufficient_final_classes:
+        raise RuntimeError(
+            "Final training data has too few samples for probability calibration: "
+            + ", ".join(insufficient_final_classes)
+        )
+
+    print(f"\nFitting final saved model on {final_training_description}...")
     model = build_model()
-    model.fit(examples, labels)
+    model.fit(examples[final_indices], labels[final_indices])
     model_classes = [str(label) for label in model.classes_]
     artifact = {
         "artifact_type": "final_eight_intent_classifier",
@@ -396,8 +442,10 @@ def train() -> None:
             }
             for label in CLASS_LABELS
         },
+        "final_training_description": final_training_description,
         "evaluation_strategy": evaluation_strategy,
-        "evaluation_metrics": metrics,
+        "evaluation_metrics": stratified_metrics,
+        "unseen_signer_metrics": unseen_signer_metrics,
     }
     MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
     joblib.dump(artifact, MODEL_PATH)
