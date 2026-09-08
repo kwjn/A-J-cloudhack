@@ -1,14 +1,44 @@
 """Streamlit interface for two-way hawker-centre communication."""
 
+import hashlib
+import re
+
 import streamlit as st
 
 from services.elevenlabs_service import (
+    SpeechTranscriptionError,
     VoiceConfigurationError,
     VoiceOutputError,
     get_voice_id,
     speak_text,
+    transcribe_audio,
 )
 from services.recognition_bridge import read_latest_prediction
+
+HAWKER_REPLY_MAP = {
+    "YES": ["yes", "can", "okay", "ok", "sure", "have"],
+    "NO": ["no", "cannot", "can't", "dont have", "don't have", "not available"],
+    "PLEASE_REPEAT": ["repeat", "say again", "again please", "pardon"],
+}
+
+SIGN_VIDEO_MAP = {
+    "YES": "assets/signs/yes.mp4",
+    "NO": "assets/signs/no.mp4",
+    "PLEASE_REPEAT": "assets/signs/please_repeat.mp4",
+}
+
+
+def map_hawker_reply(text: str) -> str | None:
+    """Map the hawker's transcript to a supported reply intent."""
+    normalized = text.lower().strip()
+
+    for intent in ("NO", "PLEASE_REPEAT", "YES"):
+        for phrase in HAWKER_REPLY_MAP[intent]:
+            pattern = rf"(?<!\w){re.escape(phrase)}(?!\w)"
+            if re.search(pattern, normalized):
+                return intent
+
+    return None
 
 
 def initialize_state() -> None:
@@ -21,6 +51,14 @@ def initialize_state() -> None:
         st.session_state.real_recognition_result = None
     if "last_prediction_id" not in st.session_state:
         st.session_state.last_prediction_id = None
+    if "hawker_transcript" not in st.session_state:
+        st.session_state.hawker_transcript = None
+    if "hawker_audio_hash" not in st.session_state:
+        st.session_state.hawker_audio_hash = None
+    if "stt_error" not in st.session_state:
+        st.session_state.stt_error = None
+    if "hawker_reply_intent" not in st.session_state:
+        st.session_state.hawker_reply_intent = None
 
 
 def status_badge(status: str) -> str:
@@ -240,14 +278,49 @@ with reply_column:
         unsafe_allow_html=True,
     )
     st.markdown(status_badge("READY"), unsafe_allow_html=True)
-    st.markdown(
-        '<div class="message-card"><div class="placeholder-text">The hawker\'s spoken reply will appear here.</div></div>',
-        unsafe_allow_html=True,
-    )
-    st.button(
-        "Record Hawker Reply",
-        disabled=True,
-        use_container_width=True,
-        help="Speech-to-text will be connected next.",
-    )
-    st.caption("Speech-to-text will be connected next.")
+
+    if st.session_state.hawker_transcript:
+        st.markdown(
+            f'<div class="message-card"><div>{st.session_state.hawker_transcript}</div></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="message-card"><div class="placeholder-text">The hawker\'s spoken reply will appear here.</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    if st.session_state.stt_error:
+        st.warning(st.session_state.stt_error)
+
+    if st.session_state.hawker_reply_intent:
+        sign_video = SIGN_VIDEO_MAP.get(
+            st.session_state.hawker_reply_intent
+        )
+
+        if sign_video:
+            st.caption("SgSL response")
+            st.video(sign_video, autoplay=True)
+
+    hawker_audio = st.audio_input("Record Hawker Reply")
+
+    if hawker_audio is not None:
+        audio_bytes = hawker_audio.getvalue()
+        audio_hash = hashlib.sha256(audio_bytes).hexdigest()
+
+        if audio_hash != st.session_state.hawker_audio_hash:
+            st.session_state.hawker_audio_hash = audio_hash
+            st.session_state.stt_error = None
+
+            try:
+                with st.spinner("Transcribing..."):
+                    st.session_state.hawker_transcript = transcribe_audio(audio_bytes)
+                    st.session_state.hawker_reply_intent = map_hawker_reply(
+                        st.session_state.hawker_transcript
+                    )
+            except (VoiceConfigurationError, SpeechTranscriptionError):
+                st.session_state.hawker_transcript = None
+                st.session_state.hawker_reply_intent = None
+                st.session_state.stt_error = (
+                    "Could not transcribe the hawker's reply. Please try again."
+                )
