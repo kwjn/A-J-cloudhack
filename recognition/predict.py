@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import time
 
+import json
 import cv2
 import joblib
 import mediapipe as mp
@@ -220,6 +221,11 @@ def finish_capture(artifact, feature_frames, valid_mask):
     try:
         result = classify_sequence(artifact, feature_frames)
         print_prediction_result(artifact, feature_frames, result)
+
+        result_path = Path(__file__).resolve().parent / "latest_result.json"
+        with result_path.open("w", encoding="utf-8") as file:
+            json.dump(result, file)
+            
         return result, None
     except (ValueError, RuntimeError) as error:
         print(f"Classification failed: {error}")

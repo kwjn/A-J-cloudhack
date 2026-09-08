@@ -1,7 +1,9 @@
 """Mock Streamlit interface for two-way hawker-centre communication."""
 
 import hashlib
+import json
 import re
+from pathlib import Path
 
 import streamlit as st
 
@@ -61,6 +63,22 @@ SIGN_VIDEO_MAP = {
     "NO": "assets/signs/no.mp4",
     "PLEASE_REPEAT": "assets/signs/please_repeat.mp4",
 }   
+LATEST_RESULT_PATH = (
+    Path(__file__).resolve().parent
+    / "recognition"
+    / "latest_result.json"
+)
+
+def read_latest_recognition_result():
+    """Read the latest completed SgSL prediction."""
+    if not LATEST_RESULT_PATH.exists():
+        return None
+
+    try:
+        with LATEST_RESULT_PATH.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return None
 
 def map_hawker_reply(text: str) -> str | None:
     """Map the hawker's transcript to a supported reply intent."""
@@ -199,6 +217,26 @@ st.markdown(
 )
 
 initialize_state()
+
+@st.fragment(run_every="1s")
+def watch_recognition_result():
+    latest_result = read_latest_recognition_result()
+
+    if not latest_result:
+        return
+
+    result_signature = json.dumps(latest_result, sort_keys=True)
+
+    if result_signature != st.session_state.get("latest_recognition_signature"):
+        st.session_state.latest_recognition_signature = result_signature
+        st.session_state.recognition_result = latest_result
+        st.session_state.signing_status = "RECOGNISED"
+        st.session_state.speech_audio = None
+        st.session_state.voice_error = None
+        st.rerun()
+
+
+watch_recognition_result()
 
 st.markdown('<div class="app-kicker">Hawker Hands</div>', unsafe_allow_html=True)
 st.title("A clearer conversation, both ways")
