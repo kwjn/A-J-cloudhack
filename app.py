@@ -1,12 +1,15 @@
 """Mock Streamlit interface for two-way hawker-centre communication."""
 
+import hashlib
 import streamlit as st
 
 from services.elevenlabs_service import (
+    SpeechTranscriptionError,
     VoiceConfigurationError,
     VoiceOutputError,
     get_voice_id,
     speak_text,
+    transcribe_audio,
 )
 
 
@@ -70,6 +73,12 @@ def initialize_state() -> None:
         st.session_state.speech_audio = None
     if "voice_error" not in st.session_state:
         st.session_state.voice_error = None
+    if "hawker_transcript" not in st.session_state:
+        st.session_state.hawker_transcript = None
+    if "hawker_audio_hash" not in st.session_state:
+        st.session_state.hawker_audio_hash = None
+    if "stt_error" not in st.session_state:
+        st.session_state.stt_error = None    
 
 
 def status_badge(status: str) -> str:
@@ -250,17 +259,39 @@ with reply_column:
         unsafe_allow_html=True,
     )
     st.markdown(status_badge("READY"), unsafe_allow_html=True)
-    st.markdown(
-        '<div class="message-card"><div class="placeholder-text">The hawker\'s spoken reply will appear here.</div></div>',
-        unsafe_allow_html=True,
-    )
-    st.button(
-        "Record Hawker Reply",
-        disabled=True,
-        use_container_width=True,
-        help="Speech-to-text will be connected next.",
-    )
-    st.caption("Speech-to-text will be connected next.")
+
+    if st.session_state.hawker_transcript:
+        st.markdown(
+            f'<div class="message-card"><div>{st.session_state.hawker_transcript}</div></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            '<div class="message-card"><div class="placeholder-text">The hawker\'s spoken reply will appear here.</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    if st.session_state.stt_error:
+        st.warning(st.session_state.stt_error)
+
+    hawker_audio = st.audio_input("Record Hawker Reply")
+
+    if hawker_audio is not None:
+        audio_bytes = hawker_audio.getvalue()
+        audio_hash = hashlib.sha256(audio_bytes).hexdigest()
+
+        if audio_hash != st.session_state.hawker_audio_hash:
+            st.session_state.hawker_audio_hash = audio_hash
+            st.session_state.stt_error = None
+
+            try:
+                with st.spinner("Transcribing..."):
+                    st.session_state.hawker_transcript = transcribe_audio(audio_bytes)
+            except (VoiceConfigurationError, SpeechTranscriptionError):
+                st.session_state.hawker_transcript = None
+                st.session_state.stt_error = (
+                    "Could not transcribe the hawker's reply. Please try again."
+                )
 
 st.divider()
 
