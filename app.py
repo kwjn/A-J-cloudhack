@@ -56,6 +56,12 @@ HAWKER_REPLY_MAP = {
     "PLEASE_REPEAT": ["repeat", "say again", "again please", "pardon"],
 }
 
+SIGN_VIDEO_MAP = {
+    "YES": "assets/signs/yes.mp4",
+    "NO": "assets/signs/no.mp4",
+    "PLEASE_REPEAT": "assets/signs/please_repeat.mp4",
+}   
+
 def map_hawker_reply(text: str) -> str | None:
     """Map the hawker's transcript to a supported reply intent."""
     normalized = text.lower().strip()
@@ -297,9 +303,13 @@ with reply_column:
         st.warning(st.session_state.stt_error)
 
     if st.session_state.hawker_reply_intent:
-        st.caption(
-            f"Mapped reply: {st.session_state.hawker_reply_intent}"
+        sign_video = SIGN_VIDEO_MAP.get(
+            st.session_state.hawker_reply_intent
     )
+
+        if sign_video:
+            st.caption("SgSL response")
+            st.video(sign_video, autoplay=True)
 
     hawker_audio = st.audio_input("Record Hawker Reply")
 
