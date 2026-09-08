@@ -1,6 +1,8 @@
 """Mock Streamlit interface for two-way hawker-centre communication."""
 
 import hashlib
+import re
+
 import streamlit as st
 
 from services.elevenlabs_service import (
@@ -48,6 +50,24 @@ MOCK_INTENTS = {
     },
 }
 
+HAWKER_REPLY_MAP = {
+    "YES": ["yes", "can", "okay", "ok", "sure", "have"],
+    "NO": ["no", "cannot", "can't", "dont have", "don't have", "not available"],
+    "PLEASE_REPEAT": ["repeat", "say again", "again please", "pardon"],
+}
+
+def map_hawker_reply(text: str) -> str | None:
+    """Map the hawker's transcript to a supported reply intent."""
+    normalized = text.lower().strip()
+
+    for intent in ("NO", "PLEASE_REPEAT", "YES"):
+        for phrase in HAWKER_REPLY_MAP[intent]:
+            pattern = rf"(?<!\w){re.escape(phrase)}(?!\w)"
+            if re.search(pattern, normalized):
+                return intent
+
+    return None
+
 # Frontend demonstration behavior only. This is not a classifier threshold.
 MOCK_REPEAT_THRESHOLD = 0.50
 
@@ -78,7 +98,9 @@ def initialize_state() -> None:
     if "hawker_audio_hash" not in st.session_state:
         st.session_state.hawker_audio_hash = None
     if "stt_error" not in st.session_state:
-        st.session_state.stt_error = None    
+        st.session_state.stt_error = None
+    if "hawker_reply_intent" not in st.session_state:
+        st.session_state.hawker_reply_intent = None    
 
 
 def status_badge(status: str) -> str:
@@ -274,6 +296,11 @@ with reply_column:
     if st.session_state.stt_error:
         st.warning(st.session_state.stt_error)
 
+    if st.session_state.hawker_reply_intent:
+        st.caption(
+            f"Mapped reply: {st.session_state.hawker_reply_intent}"
+    )
+
     hawker_audio = st.audio_input("Record Hawker Reply")
 
     if hawker_audio is not None:
@@ -287,8 +314,12 @@ with reply_column:
             try:
                 with st.spinner("Transcribing..."):
                     st.session_state.hawker_transcript = transcribe_audio(audio_bytes)
+                    st.session_state.hawker_reply_intent = map_hawker_reply(
+                        st.session_state.hawker_transcript
+)
             except (VoiceConfigurationError, SpeechTranscriptionError):
                 st.session_state.hawker_transcript = None
+                st.session_state.hawker_reply_intent = None
                 st.session_state.stt_error = (
                     "Could not transcribe the hawker's reply. Please try again."
                 )
