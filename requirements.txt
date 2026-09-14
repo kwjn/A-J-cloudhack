@@ -1,3 +1,5 @@
 streamlit>=1.40,<2
 elevenlabs>=2.66,<3
 python-dotenv>=1.0,<2
+streamlit-webrtc
+av

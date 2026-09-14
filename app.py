@@ -1,10 +1,17 @@
 """Streamlit interface for two-way hawker-centre communication."""
 
 import hashlib
+import os
 import re
+import threading
+from uuid import uuid4
 
+import av
+from dotenv import load_dotenv
 import streamlit as st
+from streamlit_webrtc import VideoProcessorBase, webrtc_streamer
 
+from recognition.live_predictor import LiveSignPredictor
 from services.elevenlabs_service import (
     SpeechTranscriptionError,
     VoiceConfigurationError,
@@ -13,7 +20,6 @@ from services.elevenlabs_service import (
     speak_text,
     transcribe_audio,
 )
-from services.recognition_bridge import read_latest_prediction
 
 HAWKER_REPLY_MAP = {
     "YES": ["yes", "can", "okay", "ok", "sure", "have"],
@@ -26,6 +32,98 @@ SIGN_VIDEO_MAP = {
     "NO": "assets/signs/no.mp4",
     "PLEASE_REPEAT": "assets/signs/please_repeat.mp4",
 }
+
+STUN_SERVER_URL = "stun:stun.l.google.com:19302"
+
+
+def build_rtc_configuration() -> dict:
+    """Build browser ICE configuration without hardcoding TURN credentials."""
+    load_dotenv()
+    ice_servers = [{"urls": [STUN_SERVER_URL]}]
+    turn_url = os.getenv("TURN_URL", "").strip()
+    turn_username = os.getenv("TURN_USERNAME", "").strip()
+    turn_credential = os.getenv("TURN_CREDENTIAL", "").strip()
+
+    if turn_url and turn_username and turn_credential:
+        ice_servers.append(
+            {
+                "urls": [turn_url],
+                "username": turn_username,
+                "credential": turn_credential,
+            }
+        )
+    return {"iceServers": ice_servers}
+
+
+class LatestPredictionStore:
+    """Thread-safe in-memory handoff from WebRTC to the Streamlit thread."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._latest = {}
+
+    def publish(self, prediction: dict) -> None:
+        latest = dict(prediction)
+        latest.setdefault("prediction_id", uuid4().hex)
+        with self._lock:
+            self._latest = latest
+
+    def read(self) -> dict | None:
+        with self._lock:
+            return dict(self._latest) if self._latest else None
+
+
+class SignVideoProcessor(VideoProcessorBase):
+    """Run the cached live predictor on frames from the browser camera."""
+
+    def __init__(
+        self,
+        predictor: LiveSignPredictor,
+        prediction_store: LatestPredictionStore,
+    ):
+        self._predictor = predictor
+        self._prediction_store = prediction_store
+        self._predictor_lock = threading.Lock()
+
+    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
+        image = frame.to_ndarray(format="bgr24")
+        with self._predictor_lock:
+            annotated_frame, prediction = self._predictor.process_frame(image)
+        if prediction is not None:
+            self._prediction_store.publish(prediction)
+        return av.VideoFrame.from_ndarray(annotated_frame, format="bgr24")
+
+    def start_recording(self) -> bool:
+        """Apply the predictor's start/stop behavior under its frame lock."""
+        with self._predictor_lock:
+            prediction = self._predictor.start_recording()
+            recording = self._predictor.recording
+        if prediction is not None:
+            self._prediction_store.publish(prediction)
+        return recording
+
+    def discard_recording(self) -> None:
+        """Apply the existing R behavior safely between video frames."""
+        with self._predictor_lock:
+            self._predictor.discard_recording()
+
+    def is_recording(self) -> bool:
+        with self._predictor_lock:
+            return self._predictor.recording
+
+
+@st.cache_resource(show_spinner="Loading sign recognition…")
+def get_live_predictor(session_key: str) -> LiveSignPredictor:
+    """Create one expensive recognition pipeline per browser session."""
+    return LiveSignPredictor(
+        control_hint="Use Start Recording and Discard below",
+    )
+
+
+@st.cache_resource
+def get_prediction_store(session_key: str) -> LatestPredictionStore:
+    """Create one WebRTC-to-Streamlit handoff per browser session."""
+    return LatestPredictionStore()
 
 
 def map_hawker_reply(text: str) -> str | None:
@@ -51,6 +149,8 @@ def initialize_state() -> None:
         st.session_state.real_recognition_result = None
     if "last_prediction_id" not in st.session_state:
         st.session_state.last_prediction_id = None
+    if "recognition_session_key" not in st.session_state:
+        st.session_state.recognition_session_key = uuid4().hex
     if "hawker_transcript" not in st.session_state:
         st.session_state.hawker_transcript = None
     if "hawker_audio_hash" not in st.session_state:
@@ -66,7 +166,7 @@ def status_badge(status: str) -> str:
     css_class = "status-ready"
     if status == "RECOGNISED":
         css_class = "status-success"
-    elif status == "RECOGNISING":
+    elif status in ("RECOGNISING", "RECORDING"):
         css_class = "status-working"
     elif status == "PLEASE REPEAT":
         css_class = "status-repeat"
@@ -79,9 +179,9 @@ def cached_speech(text: str, voice_id: str) -> bytes:
     return speak_text(text, voice_id=voice_id)
 
 
-def load_new_prediction() -> bool:
-    """Consume a newly published real prediction without replaying duplicates."""
-    latest_prediction = read_latest_prediction()
+def load_new_prediction(prediction_store: LatestPredictionStore) -> bool:
+    """Consume a new in-memory WebRTC prediction without replaying duplicates."""
+    latest_prediction = prediction_store.read()
     if (
         latest_prediction is not None
         and latest_prediction["prediction_id"] != st.session_state.last_prediction_id
@@ -95,23 +195,62 @@ def load_new_prediction() -> bool:
 
 
 @st.fragment(run_every=0.75)
-def poll_for_prediction() -> None:
+def poll_for_prediction(prediction_store: LatestPredictionStore) -> None:
     """Poll silently and refresh the full page only for a new prediction."""
-    if load_new_prediction():
+    if load_new_prediction(prediction_store):
         st.rerun()
 
 
-def render_signing_panel() -> None:
-    """Render the latest real recognition result."""
+def render_signing_panel(
+    predictor: LiveSignPredictor,
+    prediction_store: LatestPredictionStore,
+) -> None:
+    """Render the browser camera and latest real recognition result."""
     result = st.session_state.real_recognition_result
-    display_status = "RECOGNISED" if result is not None else "READY"
 
     st.header("Signing → Hawker")
     st.markdown(
         '<div class="direction-note">Your signed message, shown in English</div>',
         unsafe_allow_html=True,
     )
-    st.markdown(status_badge(display_status), unsafe_allow_html=True)
+
+    webrtc_context = webrtc_streamer(
+        key="sgsl-inline-camera",
+        video_processor_factory=lambda: SignVideoProcessor(
+            predictor,
+            prediction_store,
+        ),
+        media_stream_constraints={"video": True, "audio": False},
+        rtc_configuration=build_rtc_configuration(),
+        async_processing=True,
+    )
+    video_processor = webrtc_context.video_processor
+    recording = (
+        video_processor.is_recording()
+        if video_processor is not None
+        else False
+    )
+    st.markdown(
+        status_badge("RECORDING" if recording else "READY"),
+        unsafe_allow_html=True,
+    )
+    capture_column, discard_column = st.columns(2)
+    with capture_column:
+        if st.button(
+            "Stop Recording" if recording else "Start Recording",
+            disabled=video_processor is None,
+            use_container_width=True,
+        ):
+            video_processor.start_recording()
+            st.rerun()
+    with discard_column:
+        if st.button(
+            "Discard",
+            disabled=video_processor is None or not recording,
+            use_container_width=True,
+        ):
+            video_processor.discard_recording()
+            st.rerun()
 
     signing_message = result["text"] if result else "Waiting for a sign..."
     message_class = "message-text" if result else "placeholder-text"
@@ -256,6 +395,9 @@ st.markdown(
 )
 
 initialize_state()
+recognition_session_key = st.session_state.recognition_session_key
+live_predictor = get_live_predictor(recognition_session_key)
+prediction_store = get_prediction_store(recognition_session_key)
 
 st.markdown('<div class="app-kicker">Hawker Hands</div>', unsafe_allow_html=True)
 st.title("A clearer conversation, both ways")
@@ -264,12 +406,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-poll_for_prediction()
+poll_for_prediction(prediction_store)
 
 signing_column, reply_column = st.columns(2, gap="large")
 
 with signing_column:
-    render_signing_panel()
+    render_signing_panel(live_predictor, prediction_store)
 
 with reply_column:
     st.header("Hawker → You")

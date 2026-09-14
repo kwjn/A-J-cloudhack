@@ -1,36 +1,18 @@
-"""Live manual-capture prediction for the final eight-intent model."""
+"""Standalone OpenCV predictor for local recognition debugging only.
+
+The deployed application runs camera capture and inference inside Streamlit via
+``LiveSignPredictor`` and does not launch this script. Dataset recording remains
+available separately through ``collect_data.py``.
+"""
 
 from pathlib import Path
-from types import SimpleNamespace
 import sys
-import time
 
 import cv2
 import joblib
-import mediapipe as mp
 import numpy as np
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision
-
-from camera import (
-    MAX_POSES,
-    MODEL_PATH as HAND_MODEL_PATH,
-    POSE_MODEL_PATH,
-    associate_hands,
-    build_pose_observations,
-    draw_body_region,
-    draw_hand,
-    draw_upper_body,
-    prepare_results_for_features,
-)
-from collect_data import (
-    MAX_CAPTURED_FRAMES,
-    sample_rejection_reason,
-)
-from face_identity import SessionFaceVerifier
+from collect_data import sample_rejection_reason
 from intents import INTENTS
-from landmarks import extract_features
-from signer_session import SessionState, SignerSessionController
 from train import FEATURE_DIM, FEATURE_VERSION, FIXED_FRAMES, resample_sequence
 
 
@@ -256,209 +238,35 @@ def draw_status_lines(frame, lines) -> None:
 
 
 def show_live_prediction() -> None:
-    """Open the webcam and classify deliberately captured sign sequences."""
-    artifact = load_model_artifact()
-    print("Loaded final classes:", ", ".join(artifact["class_labels"]))
+    """Run the reusable predictor as a local OpenCV CLI debug tool."""
+    from live_predictor import LiveSignPredictor
 
-    if not HAND_MODEL_PATH.is_file():
-        raise FileNotFoundError(f"Hand Landmarker model not found: {HAND_MODEL_PATH}")
-    if not POSE_MODEL_PATH.is_file():
-        raise FileNotFoundError(f"Pose Landmarker model not found: {POSE_MODEL_PATH}")
-
-    hand_options = vision.HandLandmarkerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=str(HAND_MODEL_PATH)),
-        running_mode=vision.RunningMode.VIDEO,
-        num_hands=2,
-    )
-    pose_options = vision.PoseLandmarkerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=str(POSE_MODEL_PATH)),
-        running_mode=vision.RunningMode.VIDEO,
-        num_poses=MAX_POSES,
-    )
-    signer_session = SignerSessionController(SessionFaceVerifier())
     camera = cv2.VideoCapture(0)
     if not camera.isOpened():
         camera.release()
         raise RuntimeError("Could not open the default webcam.")
 
-    recording = False
-    feature_frames = []
-    valid_mask = []
-    last_result = None
-    status_message = "SPACE starts when signer is LOCKED"
-
     try:
-        with (
-            vision.HandLandmarker.create_from_options(hand_options) as hand_landmarker,
-            vision.PoseLandmarker.create_from_options(pose_options) as pose_landmarker,
-        ):
-            last_timestamp_ms = -1
-            tracker = signer_session.tracker
-
+        with LiveSignPredictor() as predictor:
             while True:
                 success, frame = camera.read()
                 if not success:
                     print("Could not read a frame from the webcam.")
                     break
 
-                frame = cv2.flip(frame, 1)
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(
-                    image_format=mp.ImageFormat.SRGB,
-                    data=rgb_frame,
-                )
-                timestamp_ms = max(
-                    time.monotonic_ns() // 1_000_000,
-                    last_timestamp_ms + 1,
-                )
-                last_timestamp_ms = timestamp_ms
-                hand_results = hand_landmarker.detect_for_video(
-                    mp_image,
-                    timestamp_ms,
-                )
-                pose_results = pose_landmarker.detect_for_video(
-                    mp_image,
-                    timestamp_ms,
-                )
-
-                current_time = time.monotonic()
-                observations = build_pose_observations(pose_results)
-                session_result = signer_session.update(
-                    frame,
-                    observations,
-                    current_time,
-                )
-                active_signer = session_result.active_signer
-                accepted_hands = associate_hands(
-                    hand_results,
-                    active_signer,
-                    tracker,
-                    current_time,
-                )
-                adapted_hands = prepare_results_for_features(accepted_hands)
-                adapted_pose = (
-                    SimpleNamespace(
-                        pose_landmarks=SimpleNamespace(
-                            landmark=active_signer["landmarks"]
-                        )
-                    )
-                    if active_signer is not None
-                    else None
-                )
-                frame_features = extract_features(adapted_hands, adapted_pose)
-                if frame_features.shape != (artifact["feature_dimension"],):
-                    raise RuntimeError(
-                        f"Live feature shape {frame_features.shape} does not match "
-                        f"model dimension {artifact['feature_dimension']}."
-                    )
-
-                if recording:
-                    feature_frames.append(
-                        frame_features
-                        if active_signer is not None
-                        else np.zeros(FEATURE_DIM, dtype=np.float32)
-                    )
-                    valid_mask.append(active_signer is not None)
-                    if len(feature_frames) >= MAX_CAPTURED_FRAMES:
-                        last_result, reason = finish_capture(
-                            artifact,
-                            feature_frames,
-                            valid_mask,
-                        )
-                        recording = False
-                        status_message = (
-                            f"REJECTED: {reason}"
-                            if reason
-                            else f"PREDICTION: {last_result['intent']}"
-                        )
-                        if not last_result:
-                            print(status_message)
-                        feature_frames = []
-                        valid_mask = []
-
-                display_signer = (
-                    active_signer or session_result.acquisition_candidate
-                )
-                if display_signer is not None:
-                    draw_upper_body(frame, display_signer["landmarks"])
-                    body_region = (
-                        tracker.body_region
-                        if tracker.locked
-                        else display_signer["body_region"]
-                    )
-                    draw_body_region(frame, body_region, (0, 255, 255))
-                for hand in accepted_hands:
-                    draw_hand(
-                        frame,
-                        hand["landmarks"],
-                        hand["handedness"],
-                        hand["side"],
-                    )
-
-                valid_count = sum(valid_mask)
-                prediction_text = (
-                    last_result["intent"] if last_result else "--"
-                )
-                confidence_text = (
-                    f"{last_result['confidence']:.3f}" if last_result else "--"
-                )
-                draw_status_lines(
-                    frame,
-                    (
-                        f"Signer state: {session_result.state.value}",
-                        "Capture: " + ("RECORDING" if recording else "READY"),
-                        f"Frames: {len(feature_frames)} "
-                        f"(valid {valid_count}, missing {len(valid_mask) - valid_count})",
-                        f"Last prediction: {prediction_text}",
-                        f"Confidence: {confidence_text}",
-                        status_message,
-                        "SPACE start/stop | R discard | Q quit",
-                    ),
-                )
-                cv2.imshow("SgSL Two-Intent Live Prediction", frame)
+                annotated_frame, _ = predictor.process_frame(frame)
+                cv2.imshow("SgSL Two-Intent Live Prediction", annotated_frame)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord(" "):
-                    if recording:
-                        last_result, reason = finish_capture(
-                            artifact,
-                            feature_frames,
-                            valid_mask,
-                        )
-                        recording = False
-                        status_message = (
-                            f"REJECTED: {reason}"
-                            if reason
-                            else f"PREDICTION: {last_result['intent']}"
-                        )
-                        if not last_result:
-                            print(status_message)
-                        feature_frames = []
-                        valid_mask = []
-                    elif (
-                        session_result.state is SessionState.LOCKED
-                        and active_signer is not None
-                    ):
-                        recording = True
-                        feature_frames = []
-                        valid_mask = []
-                        status_message = "Recording prediction sequence"
-                        print("Recording prediction sequence...")
-                    else:
-                        status_message = "WAIT: signer must be LOCKED"
-                        print(status_message)
+                    predictor.start_recording()
                 elif key in (ord("r"), ord("R")):
-                    recording = False
-                    feature_frames = []
-                    valid_mask = []
-                    status_message = "Current sequence discarded"
-                    print(status_message)
+                    predictor.discard_recording()
                 elif key in (ord("q"), ord("Q")):
-                    if recording:
+                    if predictor.recording:
                         print("Unclassified sequence discarded on quit.")
                     break
     finally:
-        signer_session.close()
         camera.release()
         cv2.destroyAllWindows()
 
