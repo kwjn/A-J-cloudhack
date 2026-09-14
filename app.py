@@ -1,6 +1,7 @@
 """Streamlit interface for two-way hawker-centre communication."""
 
 import hashlib
+import html
 import os
 import re
 import threading
@@ -174,7 +175,7 @@ class SignVideoProcessor(VideoProcessorBase):
 def get_live_predictor(session_key: str) -> LiveSignPredictor:
     """Create one expensive recognition pipeline per browser session."""
     return LiveSignPredictor(
-        control_hint="Use Start Recording and Discard below",
+        control_hint="Use Start recording and Stop recording below",
     )
 
 
@@ -213,8 +214,10 @@ def initialize_state() -> None:
         st.session_state.recognition_camera_status = {
             "signer_state": "STARTING",
             "recording": False,
-            "message": "Start the camera to begin.",
+            "message": "Preparing the camera…",
         }
+    if "recording_started_at" not in st.session_state:
+        st.session_state.recording_started_at = None
     if "hawker_transcript" not in st.session_state:
         st.session_state.hawker_transcript = None
     if "hawker_audio_hash" not in st.session_state:
@@ -226,15 +229,34 @@ def initialize_state() -> None:
 
 
 def status_badge(status: str) -> str:
-    """Return accessible badge markup for a known signing status."""
+    """Return accessible badge markup for a known interface status."""
+    normalized_status = status.upper()
     css_class = "status-ready"
-    if status == "RECOGNISED":
+    if normalized_status in ("RESULT", "RECOGNISED"):
         css_class = "status-success"
-    elif status in ("RECOGNISING", "RECORDING"):
+    elif normalized_status in ("COUNTDOWN", "PROCESSING"):
         css_class = "status-working"
-    elif status == "PLEASE REPEAT":
-        css_class = "status-repeat"
-    return f'<span class="status-badge {css_class}">{status}</span>'
+    elif normalized_status == "RECORDING":
+        css_class = "status-recording"
+    elif normalized_status in ("ERROR", "PLEASE REPEAT"):
+        css_class = "status-error"
+    return (
+        f'<span class="status-badge {css_class}">'
+        f'{normalized_status.title()}</span>'
+    )
+
+
+def recording_control_states(
+    camera_available: bool,
+    signer_state: str,
+    recording: bool,
+) -> tuple[bool, bool]:
+    """Return whether the Start and Stop controls should be disabled."""
+    start_disabled = (
+        not camera_available or recording or signer_state != "LOCKED"
+    )
+    stop_disabled = not camera_available or not recording
+    return start_disabled, stop_disabled
 
 
 @st.cache_data(show_spinner=False)
@@ -271,19 +293,31 @@ def poll_for_prediction(prediction_store: LatestPredictionStore) -> None:
         st.rerun()
 
 
-def render_signing_panel(
+@st.fragment(run_every=0.5)
+def render_recording_indicator(recording: bool) -> None:
+    """Keep the elapsed recording time visible without refreshing the camera."""
+    if not recording:
+        return
+    started_at = st.session_state.recording_started_at or time.monotonic()
+    elapsed = max(0.0, time.monotonic() - started_at)
+    st.markdown(
+        '<div class="recording-notice"><span></span>'
+        f'Recording sign <strong>{elapsed:0.1f}s</strong></div>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Complete your sign naturally, then select Stop recording.")
+
+
+def render_signer_panel(
     predictor: LiveSignPredictor,
     prediction_store: LatestPredictionStore,
 ) -> None:
-    """Render the browser camera and latest real recognition result."""
-    result = st.session_state.real_recognition_result
-
-    st.header("Signing → Hawker")
+    """Render the browser camera and manual sign recording controls."""
+    st.header("You")
     st.markdown(
-        '<div class="direction-note">Your signed message, shown in English</div>',
+        '<div class="direction-note">Your live signing camera</div>',
         unsafe_allow_html=True,
     )
-
     webrtc_context = webrtc_streamer(
         key="sgsl-inline-camera",
         video_processor_factory=lambda: SignVideoProcessor(
@@ -293,132 +327,255 @@ def render_signing_panel(
         media_stream_constraints={"video": True, "audio": False},
         rtc_configuration=build_rtc_configuration(),
         async_processing=True,
+        desired_playing_state=True,
+        media_toggle_controls=False,
+        video_html_attrs={"autoPlay": True, "controls": False, "muted": True},
     )
     video_processor = webrtc_context.video_processor
     camera_status = st.session_state.recognition_camera_status
     signer_state = camera_status["signer_state"]
     recording = camera_status["recording"]
     recognition_message = camera_status["message"]
-    st.markdown(
-        status_badge("RECORDING" if recording else "READY"),
-        unsafe_allow_html=True,
-    )
-    if signer_state == "LOCKED":
-        st.caption("Signer locked. Ready to record.")
-    elif video_processor is None:
-        st.caption("Start the camera and allow browser camera access.")
+    recognition_error = recognition_message.startswith("REJECTED:")
+
+    if recognition_error:
+        camera_display_status = "ERROR"
+    elif recording:
+        camera_display_status = "RECORDING"
+    elif video_processor is None or signer_state != "LOCKED":
+        camera_display_status = "PROCESSING"
     else:
-        st.caption("Hold still and face the camera while signer lock is acquired.")
-    if recognition_message.startswith("REJECTED:"):
-        st.warning(recognition_message)
+        camera_display_status = "READY"
 
-    capture_column, discard_column = st.columns(2)
-    with capture_column:
+    status_placeholder = st.empty()
+    status_placeholder.markdown(
+        status_badge(camera_display_status), unsafe_allow_html=True
+    )
+    if recognition_error:
+        st.warning("We could not read that sign. Please record it again.")
+    elif signer_state == "LOCKED":
+        st.caption("You are in frame and ready to sign.")
+    elif video_processor is None:
+        st.caption("Allow camera access in your browser to show the live preview.")
+    else:
+        st.caption("Face the camera and hold still briefly while we find you.")
+
+    render_recording_indicator(recording)
+
+    start_disabled, stop_disabled = recording_control_states(
+        video_processor is not None,
+        signer_state,
+        recording,
+    )
+    start_column, stop_column = st.columns(2)
+    with start_column:
         if st.button(
-            "Stop Recording" if recording else "Start Recording",
-            disabled=(
-                video_processor is None
-                or (not recording and signer_state != "LOCKED")
-            ),
+            "Start recording",
+            disabled=start_disabled,
             use_container_width=True,
+            type="primary",
         ):
-            if not recording:
-                countdown = st.empty()
-                for number in (3, 2, 1):
-                    countdown.markdown(
-                        f"### Recording starts in {number}…"
-                    )
-                    time.sleep(1)
-                countdown.empty()
+            st.session_state.real_recognition_result = None
+            st.session_state.speech_audio = None
+            countdown = st.empty()
+            for number in (3, 2, 1):
+                status_placeholder.markdown(
+                    status_badge("COUNTDOWN"), unsafe_allow_html=True
+                )
+                countdown.markdown(
+                    f'<div class="countdown"><span>{number}</span>'
+                    '<small>Get ready to sign</small></div>',
+                    unsafe_allow_html=True,
+                )
+                time.sleep(1)
+            countdown.empty()
             video_processor.start_recording()
+            st.session_state.recording_started_at = time.monotonic()
             st.rerun()
-    with discard_column:
+    with stop_column:
         if st.button(
-            "Discard",
-            disabled=video_processor is None or not recording,
+            "Stop recording",
+            disabled=stop_disabled,
             use_container_width=True,
+            type="secondary",
         ):
-            video_processor.discard_recording()
+            status_placeholder.markdown(
+                status_badge("PROCESSING"), unsafe_allow_html=True
+            )
+            video_processor.start_recording()
+            st.session_state.recording_started_at = None
             st.rerun()
 
-    signing_message = result["text"] if result else "Waiting for a sign..."
+
+def render_translation_result() -> None:
+    """Render the newest deduplicated SgSL translation and voice output."""
+    result = st.session_state.real_recognition_result
+    result_status = "RESULT" if result else "READY"
+    translated_text = (
+        html.escape(str(result["text"]))
+        if result
+        else "Your translated message will appear here after you record a sign."
+    )
     message_class = "message-text" if result else "placeholder-text"
+
+    st.markdown('<div class="section-label">Translation</div>', unsafe_allow_html=True)
+    st.markdown(status_badge(result_status), unsafe_allow_html=True)
     st.markdown(
-        f'<div class="message-card"><div class="{message_class}">{signing_message}</div></div>',
+        '<div class="translation-card">'
+        f'<div class="{message_class}">{translated_text}</div></div>',
         unsafe_allow_html=True,
     )
-
-    if result is not None:
+    if result:
+        intent = html.escape(str(result["intent"]).replace("_", " ").title())
         st.markdown(
-            f'<div class="confidence">Confidence: {result["confidence"]:.0%}</div>',
+            '<div class="result-meta">'
+            f'<span>{intent}</span>'
+            f'<span>Confidence {float(result["confidence"]):.0%}</span></div>',
             unsafe_allow_html=True,
         )
-        st.caption(f"Intent: {result['intent']}")
-        if result["critical"]:
+        if result["intent"] == "ALLERGY" or result["critical"]:
             st.markdown(
-                '<div class="critical-note">Important dietary/safety message</div>',
+                '<div class="critical-note"><strong>Food allergy alert</strong>'
+                '<span>Please take extra care when preparing this order.</span></div>',
                 unsafe_allow_html=True,
             )
 
-    can_speak = result is not None
     if st.button(
-        "Speak to Hawker",
-        disabled=not can_speak,
+        "Play translation aloud",
+        disabled=result is None,
         use_container_width=True,
-        type="primary" if can_speak else "secondary",
-        help=(
-            "Generate voice output for the displayed message."
-            if can_speak
-            else "Recognise a message before using voice output."
-        ),
+        type="secondary",
+        help="Recognise a message first." if result is None else None,
     ):
         st.session_state.voice_error = None
         try:
-            with st.spinner("Preparing voice output…"):
+            with st.spinner("Preparing audio…"):
                 voice_id = get_voice_id()
                 st.session_state.speech_audio = cached_speech(
-                    result["text"],
-                    voice_id,
+                    result["text"], voice_id
                 )
-        except VoiceConfigurationError as error:
+        except VoiceConfigurationError:
             st.session_state.speech_audio = None
-            st.session_state.voice_error = str(error)
+            st.session_state.voice_error = (
+                "Voice playback is not configured. You can still show the written translation."
+            )
         except (VoiceOutputError, ValueError):
             st.session_state.speech_audio = None
             st.session_state.voice_error = (
-                "ElevenLabs could not generate audio. Check the connection and configuration."
+                "Voice playback is unavailable right now. Please use the written translation."
             )
 
     if st.session_state.voice_error:
-        st.warning("Voice output unavailable. Please use the displayed message.")
+        st.warning(st.session_state.voice_error)
     elif st.session_state.speech_audio is not None:
-        st.audio(
-            st.session_state.speech_audio,
-            format="audio/mpeg",
-            autoplay=True,
+        st.audio(st.session_state.speech_audio, format="audio/mpeg", autoplay=True)
+
+
+def render_staff_panel() -> None:
+    """Render existing staff transcription and mapped response videos."""
+    transcript = st.session_state.hawker_transcript
+    reply_intent = st.session_state.hawker_reply_intent
+    sign_video = SIGN_VIDEO_MAP.get(reply_intent) if reply_intent else None
+
+    st.header("Staff")
+    st.markdown(
+        '<div class="direction-note">Staff response</div>',
+        unsafe_allow_html=True,
+    )
+    if sign_video:
+        st.video(sign_video, autoplay=True)
+    else:
+        placeholder = (
+            "No signed response is available for this reply."
+            if transcript
+            else "Staff response will appear here"
         )
+        st.markdown(
+            '<div class="video-placeholder"><div>'
+            f'{html.escape(placeholder)}</div></div>',
+            unsafe_allow_html=True,
+        )
+
+    staff_status = (
+        "ERROR"
+        if st.session_state.stt_error
+        else "RESULT"
+        if transcript
+        else "READY"
+    )
+    st.markdown(status_badge(staff_status), unsafe_allow_html=True)
+    if transcript:
+        st.markdown(
+            '<div class="transcript-card"><div class="result-label">Staff said</div>'
+            f'<div>{html.escape(transcript)}</div></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("Record the staff member's reply to display it as text.")
+
+    if st.session_state.stt_error:
+        st.warning(st.session_state.stt_error)
+
+    hawker_audio = st.audio_input("Record staff reply")
+    if hawker_audio is None:
+        return
+    audio_bytes = hawker_audio.getvalue()
+    audio_hash = hashlib.sha256(audio_bytes).hexdigest()
+    if audio_hash == st.session_state.hawker_audio_hash:
+        return
+
+    st.session_state.hawker_audio_hash = audio_hash
+    st.session_state.stt_error = None
+    try:
+        with st.spinner("Turning speech into text…"):
+            st.session_state.hawker_transcript = transcribe_audio(audio_bytes)
+            st.session_state.hawker_reply_intent = map_hawker_reply(
+                st.session_state.hawker_transcript
+            )
+        st.rerun()
+    except VoiceConfigurationError:
+        st.session_state.hawker_transcript = None
+        st.session_state.hawker_reply_intent = None
+        st.session_state.stt_error = (
+            "Speech transcription is not configured. Please add the ElevenLabs API key and try again."
+        )
+    except SpeechTranscriptionError:
+        st.session_state.hawker_transcript = None
+        st.session_state.hawker_reply_intent = None
+        st.session_state.stt_error = (
+            "We couldn't understand that recording. Please try again."
+        )
+    st.rerun()
 
 
 st.set_page_config(
-    page_title="Hawker Hands",
-    page_icon="🤝",
+    page_title="Clear Conversation",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
+# ---------------------------------------------------------------------------
+# Accessibility-focused visual system
+# ---------------------------------------------------------------------------
 st.markdown(
     """
     <style>
     :root {
-        --ink: #17211b;
-        --muted: #5e6b63;
-        --cream: #fffdf7;
-        --green: #0b6847;
-        --green-soft: #e7f5ee;
-        --amber-soft: #fff3d5;
-        --border: #dce5df;
+        --ink: #172033;
+        --muted: #67645f;
+        --surface: #fffaf0;
+        --background: #eee7d9;
+        --accent: #416b8b;
+        --accent-soft: #e7eef3;
+        --border: #d7cdbd;
+        --danger: #b42318;
+        --danger-soft: #fff1f0;
     }
-    .stApp { background: #f4f1e8; color: var(--ink); }
+    #MainMenu, footer, [data-testid="stHeader"],
+    [data-testid="stToolbar"], [data-testid="stDecoration"] {
+        display: none !important;
+    }
+    .stApp { background: var(--background); color: var(--ink); }
     [data-testid="stAppViewContainer"],
     [data-testid="stAppViewContainer"] p,
     [data-testid="stAppViewContainer"] label,
@@ -426,57 +583,225 @@ st.markdown(
     [data-testid="stCaptionContainer"] p {
         color: var(--ink);
     }
-    .block-container { max-width: 1120px; padding: 1.6rem 2rem 2rem; }
-    h1 { color: var(--ink); font-size: clamp(2rem, 4vw, 3.15rem) !important; }
-    h2 { color: var(--ink); font-size: clamp(1.45rem, 2.5vw, 2rem) !important; }
-    .app-kicker {
-        color: var(--green); font-size: .82rem; font-weight: 800;
-        letter-spacing: .12em; text-transform: uppercase; margin-bottom: .25rem;
+    .block-container {
+        max-width: 1240px;
+        padding: 1.7rem 2rem 3rem;
     }
-    .app-subtitle { color: var(--muted); font-size: 1.08rem; margin: -.4rem 0 1.4rem; }
+    .app-header {
+        margin-bottom: 1.8rem;
+        max-width: 760px;
+    }
+    .app-name {
+        color: var(--ink);
+        font-size: clamp(2rem, 4vw, 3rem);
+        font-weight: 760;
+        letter-spacing: -.035em;
+        line-height: 1.08;
+        margin: 0 0 .55rem;
+    }
+    .app-subtitle {
+        color: var(--muted);
+        font-size: 1.08rem;
+        line-height: 1.55;
+        margin: 0;
+    }
+    h2 {
+        color: var(--ink);
+        font-size: clamp(1.3rem, 2.2vw, 1.65rem) !important;
+        letter-spacing: -.015em;
+        margin-bottom: .2rem !important;
+    }
+    [data-testid="stVerticalBlockBorderWrapper"] {
+        background: var(--surface);
+        border: 1px solid var(--border) !important;
+        border-radius: 18px !important;
+        box-shadow: 0 8px 22px rgba(56, 47, 36, .07);
+        padding: .35rem;
+    }
+    [data-testid="stVerticalBlockBorderWrapper"] > div {
+        height: 100%;
+    }
     .message-card {
-        min-height: 155px; display: flex; align-items: center;
-        background: var(--cream); border: 2px solid var(--border);
-        border-radius: 20px; padding: 1.5rem 1.7rem; margin: .8rem 0 .65rem;
-        box-shadow: 0 5px 18px rgba(35, 54, 43, .06);
+        min-height: 148px;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        background: #fbfcfe;
+        border: 1px solid var(--border);
+        border-radius: 14px;
+        padding: 1.35rem 1.45rem;
+        margin: .9rem 0 .65rem;
     }
     .message-text {
-        color: var(--ink); font-size: clamp(2rem, 4vw, 3.25rem);
-        font-weight: 750; line-height: 1.12; letter-spacing: -.025em;
+        color: var(--ink);
+        font-size: clamp(1.8rem, 3.2vw, 2.55rem);
+        font-weight: 720;
+        line-height: 1.18;
+        letter-spacing: -.025em;
     }
     .placeholder-text {
-        color: var(--muted); font-size: clamp(1.55rem, 3vw, 2.35rem);
-        font-weight: 600; line-height: 1.2;
+        color: var(--muted);
+        font-size: 1.15rem;
+        font-weight: 520;
+        line-height: 1.45;
+    }
+    .result-label {
+        color: var(--muted);
+        font-size: .76rem;
+        font-weight: 700;
+        letter-spacing: .08em;
+        margin-bottom: .55rem;
+        text-transform: uppercase;
+    }
+    .result-meta {
+        color: var(--muted);
+        display: flex;
+        font-size: .9rem;
+        gap: 1rem;
+        justify-content: space-between;
+        margin-bottom: .7rem;
     }
     .status-badge {
-        display: inline-block; border-radius: 999px; padding: .38rem .78rem;
-        font-size: .8rem; font-weight: 850; letter-spacing: .08em;
+        display: inline-flex;
+        align-items: center;
+        border-radius: 999px;
+        padding: .35rem .7rem;
+        font-size: .78rem;
+        font-weight: 750;
+        letter-spacing: .025em;
     }
-    .status-ready { background: #edf0ee; color: #3f4c44; }
-    .status-success { background: var(--green-soft); color: var(--green); }
-    .status-working { background: #e8f0ff; color: #2459a6; }
-    .status-repeat { background: var(--amber-soft); color: #745300; }
-    .confidence { color: var(--muted); font-size: 1rem; font-weight: 650; }
+    .status-ready { background: #eef0f3; color: #344054; }
+    .status-success, .status-working {
+        background: var(--accent-soft);
+        color: #174ea6;
+    }
+    .status-recording, .status-error {
+        background: var(--danger-soft);
+        color: var(--danger);
+    }
+    .recording-notice {
+        align-items: center;
+        background: var(--danger-soft);
+        border-radius: 10px;
+        color: #7a271a;
+        display: flex;
+        font-size: .92rem;
+        font-weight: 650;
+        gap: .65rem;
+        margin: .65rem 0;
+        padding: .7rem .8rem;
+    }
+    .recording-notice span {
+        background: #d92d20;
+        border-radius: 50%;
+        display: inline-block;
+        height: .65rem;
+        width: .65rem;
+    }
+    .countdown {
+        color: var(--accent);
+        display: flex;
+        flex-direction: column;
+        font-weight: 780;
+        padding: .8rem 0;
+        text-align: center;
+    }
+    .countdown span { font-size: 4rem; line-height: 1; }
+    .countdown small {
+        color: var(--muted);
+        font-size: .9rem;
+        font-weight: 600;
+        margin-top: .45rem;
+    }
     .critical-note {
-        background: var(--amber-soft); border-left: 5px solid #d79c14;
-        border-radius: 10px; color: #5e470d; font-weight: 720;
-        margin: .8rem 0; padding: .72rem .9rem;
+        background: var(--danger-soft);
+        border-left: 4px solid var(--danger);
+        border-radius: 10px;
+        color: #7a271a;
+        margin: .8rem 0;
+        padding: .8rem .9rem;
     }
-    .direction-note { color: var(--muted); margin-top: -.45rem; }
+    .critical-note span {
+        display: block;
+        margin-top: .2rem;
+    }
+    .section-label {
+        color: var(--ink);
+        font-size: 1.28rem;
+        font-weight: 760;
+        margin: 1.6rem 0 .55rem;
+    }
+    .translation-card {
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        box-shadow: 0 8px 22px rgba(56, 47, 36, .07);
+        margin: .65rem 0 .6rem;
+        min-height: 130px;
+        padding: 1.5rem 1.7rem;
+        display: flex;
+        align-items: center;
+    }
+    .video-placeholder {
+        align-items: center;
+        aspect-ratio: 16 / 9;
+        background: #f4eddf;
+        border: 1px solid var(--border);
+        border-radius: 13px;
+        color: var(--muted);
+        display: flex;
+        justify-content: center;
+        margin-bottom: .8rem;
+        min-height: 260px;
+        padding: 2rem;
+        text-align: center;
+    }
+    .transcript-card {
+        background: #f8f1e5;
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        color: var(--ink);
+        font-size: 1.15rem;
+        line-height: 1.45;
+        margin: .7rem 0;
+        min-height: 92px;
+        padding: 1rem 1.1rem;
+    }
+    .direction-note {
+        color: var(--muted);
+        font-size: .95rem;
+        margin: -.2rem 0 .75rem;
+    }
     div.stButton > button {
-        min-height: 3rem; font-size: 1rem; font-weight: 700;
-        color: var(--ink); background: var(--cream); border-color: #aebbb3;
+        min-height: 2.85rem;
+        border-radius: 10px;
+        font-size: .96rem;
+        font-weight: 680;
     }
     div.stButton > button[kind="primary"] {
-        color: #ffffff; background: var(--green); border-color: var(--green);
+        color: #ffffff;
+        background: var(--accent);
+        border-color: var(--accent);
+    }
+    div.stButton > button[kind="secondary"] {
+        color: var(--ink);
+        background: var(--surface);
+        border-color: var(--border);
     }
     div.stButton > button:disabled {
-        color: #5d6861 !important; background: #e4e5df !important;
-        border-color: #b9c0bb !important; opacity: 1 !important;
+        color: #667085 !important;
+        background: #f2f4f7 !important;
+        border-color: #d0d5dd !important;
+        opacity: 1 !important;
     }
-    @media (max-width: 700px) {
-        .block-container { padding: 1rem; }
-        .message-card { min-height: 130px; padding: 1.1rem; }
+    [data-testid="stVideo"] video,
+    video {
+        border-radius: 12px;
+        aspect-ratio: 16 / 9;
+        object-fit: cover;
+    }
+    [data-testid="stAudioInput"] {
+        border-radius: 12px;
     }
     </style>
     """,
@@ -488,10 +813,10 @@ recognition_session_key = st.session_state.recognition_session_key
 live_predictor = get_live_predictor(recognition_session_key)
 prediction_store = get_prediction_store(recognition_session_key)
 
-st.markdown('<div class="app-kicker">Hawker Hands</div>', unsafe_allow_html=True)
-st.title("A clearer conversation, both ways")
 st.markdown(
-    '<div class="app-subtitle">A simple communication aid for Deaf customers and hawkers.</div>',
+    '<div class="app-header"><div class="app-name">Clear Conversation</div>'
+    '<p class="app-subtitle">A simple two-way communication aid for signers '
+    'and staff.</p></div>',
     unsafe_allow_html=True,
 )
 
@@ -500,58 +825,11 @@ poll_for_prediction(prediction_store)
 signing_column, reply_column = st.columns(2, gap="large")
 
 with signing_column:
-    render_signing_panel(live_predictor, prediction_store)
+    with st.container(border=True):
+        render_signer_panel(live_predictor, prediction_store)
 
 with reply_column:
-    st.header("Hawker → You")
-    st.markdown(
-        '<div class="direction-note">The hawker’s spoken reply, shown as text</div>',
-        unsafe_allow_html=True,
-    )
-    st.markdown(status_badge("READY"), unsafe_allow_html=True)
+    with st.container(border=True):
+        render_staff_panel()
 
-    if st.session_state.hawker_transcript:
-        st.markdown(
-            f'<div class="message-card"><div>{st.session_state.hawker_transcript}</div></div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            '<div class="message-card"><div class="placeholder-text">The hawker\'s spoken reply will appear here.</div></div>',
-            unsafe_allow_html=True,
-        )
-
-    if st.session_state.stt_error:
-        st.warning(st.session_state.stt_error)
-
-    if st.session_state.hawker_reply_intent:
-        sign_video = SIGN_VIDEO_MAP.get(
-            st.session_state.hawker_reply_intent
-        )
-
-        if sign_video:
-            st.caption("SgSL response")
-            st.video(sign_video, autoplay=True)
-
-    hawker_audio = st.audio_input("Record Hawker Reply")
-
-    if hawker_audio is not None:
-        audio_bytes = hawker_audio.getvalue()
-        audio_hash = hashlib.sha256(audio_bytes).hexdigest()
-
-        if audio_hash != st.session_state.hawker_audio_hash:
-            st.session_state.hawker_audio_hash = audio_hash
-            st.session_state.stt_error = None
-
-            try:
-                with st.spinner("Transcribing..."):
-                    st.session_state.hawker_transcript = transcribe_audio(audio_bytes)
-                    st.session_state.hawker_reply_intent = map_hawker_reply(
-                        st.session_state.hawker_transcript
-                    )
-            except (VoiceConfigurationError, SpeechTranscriptionError):
-                st.session_state.hawker_transcript = None
-                st.session_state.hawker_reply_intent = None
-                st.session_state.stt_error = (
-                    "Could not transcribe the hawker's reply. Please try again."
-                )
+render_translation_result()
