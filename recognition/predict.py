@@ -8,17 +8,32 @@ available separately through ``collect_data.py``.
 from pathlib import Path
 import sys
 
+
+RECOGNITION_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = RECOGNITION_DIR.parent
+for import_path in (RECOGNITION_DIR, PROJECT_ROOT):
+    if str(import_path) not in sys.path:
+        sys.path.insert(0, str(import_path))
+
+
 import cv2
 import joblib
 import numpy as np
-from collect_data import sample_rejection_reason
-from intents import INTENTS
-from train import FEATURE_DIM, FEATURE_VERSION, FIXED_FRAMES, resample_sequence
 
+try:
+    from .collect_data import sample_rejection_reason
+    from .intents import INTENTS
+    from .train import (
+        FEATURE_DIM,
+        FEATURE_VERSION,
+        FIXED_FRAMES,
+        resample_sequence,
+    )
+except ImportError:  # Keep direct ``python recognition/predict.py`` support.
+    from collect_data import sample_rejection_reason
+    from intents import INTENTS
+    from train import FEATURE_DIM, FEATURE_VERSION, FIXED_FRAMES, resample_sequence
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
 from services.recognition_bridge import publish_prediction
 
@@ -239,7 +254,10 @@ def draw_status_lines(frame, lines) -> None:
 
 def show_live_prediction() -> None:
     """Run the reusable predictor as a local OpenCV CLI debug tool."""
-    from live_predictor import LiveSignPredictor
+    try:
+        from .live_predictor import LiveSignPredictor
+    except ImportError:
+        from live_predictor import LiveSignPredictor
 
     camera = cv2.VideoCapture(0)
     if not camera.isOpened():

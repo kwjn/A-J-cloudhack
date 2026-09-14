@@ -4,6 +4,7 @@ import hashlib
 import os
 import re
 import threading
+import time
 from uuid import uuid4
 
 import av
@@ -61,6 +62,11 @@ class LatestPredictionStore:
     def __init__(self):
         self._lock = threading.Lock()
         self._latest = {}
+        self._recognition_status = {
+            "signer_state": "STARTING",
+            "recording": False,
+            "message": "Starting camera…",
+        }
 
     def publish(self, prediction: dict) -> None:
         latest = dict(prediction)
@@ -71,6 +77,24 @@ class LatestPredictionStore:
     def read(self) -> dict | None:
         with self._lock:
             return dict(self._latest) if self._latest else None
+
+    def publish_status(
+        self,
+        signer_state: str,
+        recording: bool,
+        message: str,
+    ) -> None:
+        status = {
+            "signer_state": signer_state,
+            "recording": recording,
+            "message": message,
+        }
+        with self._lock:
+            self._recognition_status = status
+
+    def read_status(self) -> dict:
+        with self._lock:
+            return dict(self._recognition_status)
 
 
 class SignVideoProcessor(VideoProcessorBase):
@@ -89,6 +113,18 @@ class SignVideoProcessor(VideoProcessorBase):
         image = frame.to_ndarray(format="bgr24")
         with self._predictor_lock:
             annotated_frame, prediction = self._predictor.process_frame(image)
+            signer_state = (
+                self._predictor.session_result.state.value
+                if self._predictor.session_result is not None
+                else "STARTING"
+            )
+            recording = self._predictor.recording
+            status_message = self._predictor.status_message
+        self._prediction_store.publish_status(
+            signer_state,
+            recording,
+            status_message,
+        )
         if prediction is not None:
             self._prediction_store.publish(prediction)
         return av.VideoFrame.from_ndarray(annotated_frame, format="bgr24")
@@ -98,6 +134,17 @@ class SignVideoProcessor(VideoProcessorBase):
         with self._predictor_lock:
             prediction = self._predictor.start_recording()
             recording = self._predictor.recording
+            signer_state = (
+                self._predictor.session_result.state.value
+                if self._predictor.session_result is not None
+                else "STARTING"
+            )
+            status_message = self._predictor.status_message
+        self._prediction_store.publish_status(
+            signer_state,
+            recording,
+            status_message,
+        )
         if prediction is not None:
             self._prediction_store.publish(prediction)
         return recording
@@ -106,6 +153,17 @@ class SignVideoProcessor(VideoProcessorBase):
         """Apply the existing R behavior safely between video frames."""
         with self._predictor_lock:
             self._predictor.discard_recording()
+            signer_state = (
+                self._predictor.session_result.state.value
+                if self._predictor.session_result is not None
+                else "STARTING"
+            )
+            status_message = self._predictor.status_message
+        self._prediction_store.publish_status(
+            signer_state,
+            False,
+            status_message,
+        )
 
     def is_recording(self) -> bool:
         with self._predictor_lock:
@@ -151,6 +209,12 @@ def initialize_state() -> None:
         st.session_state.last_prediction_id = None
     if "recognition_session_key" not in st.session_state:
         st.session_state.recognition_session_key = uuid4().hex
+    if "recognition_camera_status" not in st.session_state:
+        st.session_state.recognition_camera_status = {
+            "signer_state": "STARTING",
+            "recording": False,
+            "message": "Start the camera to begin.",
+        }
     if "hawker_transcript" not in st.session_state:
         st.session_state.hawker_transcript = None
     if "hawker_audio_hash" not in st.session_state:
@@ -179,8 +243,9 @@ def cached_speech(text: str, voice_id: str) -> bytes:
     return speak_text(text, voice_id=voice_id)
 
 
-def load_new_prediction(prediction_store: LatestPredictionStore) -> bool:
-    """Consume a new in-memory WebRTC prediction without replaying duplicates."""
+def load_recognition_updates(prediction_store: LatestPredictionStore) -> bool:
+    """Consume changed WebRTC prediction or capture state."""
+    changed = False
     latest_prediction = prediction_store.read()
     if (
         latest_prediction is not None
@@ -190,14 +255,19 @@ def load_new_prediction(prediction_store: LatestPredictionStore) -> bool:
         st.session_state.last_prediction_id = latest_prediction["prediction_id"]
         st.session_state.speech_audio = None
         st.session_state.voice_error = None
-        return True
-    return False
+        changed = True
+
+    latest_status = prediction_store.read_status()
+    if latest_status != st.session_state.recognition_camera_status:
+        st.session_state.recognition_camera_status = latest_status
+        changed = True
+    return changed
 
 
 @st.fragment(run_every=0.75)
 def poll_for_prediction(prediction_store: LatestPredictionStore) -> None:
-    """Poll silently and refresh the full page only for a new prediction."""
-    if load_new_prediction(prediction_store):
+    """Refresh only when a WebRTC prediction or capture state changes."""
+    if load_recognition_updates(prediction_store):
         st.rerun()
 
 
@@ -225,22 +295,41 @@ def render_signing_panel(
         async_processing=True,
     )
     video_processor = webrtc_context.video_processor
-    recording = (
-        video_processor.is_recording()
-        if video_processor is not None
-        else False
-    )
+    camera_status = st.session_state.recognition_camera_status
+    signer_state = camera_status["signer_state"]
+    recording = camera_status["recording"]
+    recognition_message = camera_status["message"]
     st.markdown(
         status_badge("RECORDING" if recording else "READY"),
         unsafe_allow_html=True,
     )
+    if signer_state == "LOCKED":
+        st.caption("Signer locked. Ready to record.")
+    elif video_processor is None:
+        st.caption("Start the camera and allow browser camera access.")
+    else:
+        st.caption("Hold still and face the camera while signer lock is acquired.")
+    if recognition_message.startswith("REJECTED:"):
+        st.warning(recognition_message)
+
     capture_column, discard_column = st.columns(2)
     with capture_column:
         if st.button(
             "Stop Recording" if recording else "Start Recording",
-            disabled=video_processor is None,
+            disabled=(
+                video_processor is None
+                or (not recording and signer_state != "LOCKED")
+            ),
             use_container_width=True,
         ):
+            if not recording:
+                countdown = st.empty()
+                for number in (3, 2, 1):
+                    countdown.markdown(
+                        f"### Recording starts in {number}…"
+                    )
+                    time.sleep(1)
+                countdown.empty()
             video_processor.start_recording()
             st.rerun()
     with discard_column:
