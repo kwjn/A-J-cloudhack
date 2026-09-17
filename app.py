@@ -3,6 +3,7 @@
 import hashlib
 import html
 import os
+from pathlib import Path
 import re
 import threading
 import time
@@ -24,15 +25,24 @@ from services.elevenlabs_service import (
 )
 
 HAWKER_REPLY_MAP = {
-    "YES": ["yes", "can", "okay", "ok", "sure", "have"],
-    "NO": ["no", "cannot", "can't", "dont have", "don't have", "not available"],
+    "YES": [
+        "yes", "can", "okay", "ok", "sure", "have", "i have it",
+        "we have it", "i can", "we can",
+    ],
+    "NO": [
+        "no", "cannot", "can't", "dont have", "don't have", "not available",
+        "not okay", "not ok", "do not have", "i do not have it",
+        "i don't have it", "we do not have it", "we don't have it",
+        "i cannot", "we cannot", "i can't", "we can't",
+    ],
     "PLEASE_REPEAT": ["repeat", "say again", "again please", "pardon"],
 }
 
+APP_DIR = Path(__file__).resolve().parent
 SIGN_VIDEO_MAP = {
-    "YES": "assets/signs/yes.mp4",
-    "NO": "assets/signs/no.mp4",
-    "PLEASE_REPEAT": "assets/signs/please_repeat.mp4",
+    "YES": str(APP_DIR / "assets/signs/yes.mp4"),
+    "NO": str(APP_DIR / "assets/signs/no.mp4"),
+    "PLEASE_REPEAT": str(APP_DIR / "assets/signs/please_repeat.mp4"),
 }
 
 STUN_SERVER_URL = "stun:stun.l.google.com:19302"
@@ -121,19 +131,27 @@ class SignVideoProcessor(VideoProcessorBase):
             )
             recording = self._predictor.recording
             status_message = self._predictor.status_message
-        self._prediction_store.publish_status(
-            signer_state,
-            recording,
-            status_message,
-        )
-        if prediction is not None:
-            self._prediction_store.publish(prediction)
+            self._prediction_store.publish_status(
+                signer_state, recording, status_message,
+            )
+            if prediction is not None:
+                self._prediction_store.publish(prediction)
         return av.VideoFrame.from_ndarray(annotated_frame, format="bgr24")
 
     def start_recording(self) -> bool:
-        """Apply the predictor's start/stop behavior under its frame lock."""
+        """Start only if capture is currently stopped."""
+        return self._set_recording(True)
+
+    def stop_recording(self) -> bool:
+        """Stop only if capture is currently running, including after auto-stop."""
+        return self._set_recording(False)
+
+    def _set_recording(self, requested: bool) -> bool:
+        """Check and change capture state atomically with frame processing."""
         with self._predictor_lock:
-            prediction = self._predictor.start_recording()
+            prediction = None
+            if self._predictor.recording != requested:
+                prediction = self._predictor.start_recording()
             recording = self._predictor.recording
             signer_state = (
                 self._predictor.session_result.state.value
@@ -141,13 +159,11 @@ class SignVideoProcessor(VideoProcessorBase):
                 else "STARTING"
             )
             status_message = self._predictor.status_message
-        self._prediction_store.publish_status(
-            signer_state,
-            recording,
-            status_message,
-        )
-        if prediction is not None:
-            self._prediction_store.publish(prediction)
+            self._prediction_store.publish_status(
+                signer_state, recording, status_message,
+            )
+            if prediction is not None:
+                self._prediction_store.publish(prediction)
         return recording
 
     def discard_recording(self) -> None:
@@ -186,16 +202,22 @@ def get_prediction_store(session_key: str) -> LatestPredictionStore:
 
 
 def map_hawker_reply(text: str) -> str | None:
-    """Map the hawker's transcript to a supported reply intent."""
-    normalized = text.lower().strip()
-
-    for intent in ("NO", "PLEASE_REPEAT", "YES"):
-        for phrase in HAWKER_REPLY_MAP[intent]:
-            pattern = rf"(?<!\w){re.escape(phrase)}(?!\w)"
-            if re.search(pattern, normalized):
-                return intent
-
-    return None
+    """Map complete supported replies; leave ambiguous speech as text only."""
+    normalized = text.casefold().replace("\u2019", "'").replace("\u2018", "'")
+    normalized = re.sub(r"[^\w\s']", " ", normalized)
+    normalized = " ".join(normalized.split())
+    for intent, phrases in HAWKER_REPLY_MAP.items():
+        if normalized in phrases:
+            return intent
+    # Allow polite wrappers, but never infer affirmation from a word embedded
+    # in a longer sentence (e.g. 'not okay' or 'can you check?').
+    normalized = re.sub(r"^(?:please|sorry)\s+", "", normalized)
+    normalized = re.sub(r"\s+(?:please|thank you|thanks)$", "", normalized)
+    matches = {
+        intent for intent, phrases in HAWKER_REPLY_MAP.items()
+        if normalized in phrases
+    }
+    return matches.pop() if len(matches) == 1 else None
 
 
 def initialize_state() -> None:
@@ -222,6 +244,8 @@ def initialize_state() -> None:
         st.session_state.hawker_transcript = None
     if "hawker_audio_hash" not in st.session_state:
         st.session_state.hawker_audio_hash = None
+    if "hawker_failed_audio_hash" not in st.session_state:
+        st.session_state.hawker_failed_audio_hash = None
     if "stt_error" not in st.session_state:
         st.session_state.stt_error = None
     if "hawker_reply_intent" not in st.session_state:
@@ -389,8 +413,11 @@ def render_signer_panel(
                 )
                 time.sleep(1)
             countdown.empty()
-            video_processor.start_recording()
-            st.session_state.recording_started_at = time.monotonic()
+            if video_processor.start_recording():
+                if st.session_state.recording_started_at is None:
+                    st.session_state.recording_started_at = time.monotonic()
+            else:
+                st.session_state.recording_started_at = None
             st.rerun()
     with stop_column:
         if st.button(
@@ -402,7 +429,7 @@ def render_signer_panel(
             status_placeholder.markdown(
                 status_badge("PROCESSING"), unsafe_allow_html=True
             )
-            video_processor.start_recording()
+            video_processor.stop_recording()
             st.session_state.recording_started_at = None
             st.rerun()
 
@@ -524,7 +551,10 @@ def render_staff_panel() -> None:
     if audio_hash == st.session_state.hawker_audio_hash:
         return
 
-    st.session_state.hawker_audio_hash = audio_hash
+    if audio_hash == st.session_state.hawker_failed_audio_hash:
+        if not st.button("Retry transcription", key="retry_transcription"):
+            return
+
     st.session_state.stt_error = None
     try:
         with st.spinner("Turning speech into text…"):
@@ -532,6 +562,8 @@ def render_staff_panel() -> None:
             st.session_state.hawker_reply_intent = map_hawker_reply(
                 st.session_state.hawker_transcript
             )
+        st.session_state.hawker_audio_hash = audio_hash
+        st.session_state.hawker_failed_audio_hash = None
         st.rerun()
     except VoiceConfigurationError:
         st.session_state.hawker_transcript = None
@@ -545,6 +577,7 @@ def render_staff_panel() -> None:
         st.session_state.stt_error = (
             "We couldn't understand that recording. Please try again."
         )
+    st.session_state.hawker_failed_audio_hash = audio_hash
     st.rerun()
 
 

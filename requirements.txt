@@ -3,3 +3,4 @@ elevenlabs>=2.66,<3
 python-dotenv>=1.0,<2
 streamlit-webrtc
 av
+-r recognition/requirements.txt
